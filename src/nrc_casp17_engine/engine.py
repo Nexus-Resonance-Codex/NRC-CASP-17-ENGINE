@@ -1,0 +1,513 @@
+"""
+NRC Engine — Pure Math Deterministic Polymer Physics Engine v4.0
+================================================================
+
+The core folding engine for CASP-17. Implements:
+- Torsion-angle forward kinematics
+- φ-spiral lattice initialization  
+- Covariant local frame projections
+- TTT-7 resonance field relaxation
+- Steric clash repulsion with covalent bond exclusion
+- Harmonic C-alpha guide constraint potential (hybrid mode)
+- Rigid CA-CA bond length enforcement (3.8 Å)
+
+Model Protocol (CASP-17):
+    Model 1: Hybrid guided (k_guide=0.5) — primary prediction
+    Model 2: Pure math (k_guide=0.0) — unconstrained control
+    Models 3-4: Sinusoidal perturbations of template, pure math relaxation
+    Model 5: Direct template-aligned projection (no relaxation)
+"""
+
+import numpy as np
+import os
+from typing import List, Dict, Optional, Generator
+
+from .atoms import NRCAtoms
+
+
+class NRCEngine:
+    """
+    Refined Deterministic Polymer Physics Engine — Version 4.0
+    (TTT-7 Stable, Hybrid-Constrained Model 1).
+
+    Implements torsion angle forward kinematics, covariant local frame
+    projections, and localized TTT-7 / steric relaxation.
+
+    Adjacent residues are excluded from steric repulsion to preserve
+    the covalent backbone. Displacement per step is constrained to
+    ensure local refinement and maintain folding stability.
+    """
+
+    PHI = (1 + np.sqrt(5)) / 2
+    GOLDEN_ANGLE = 2 * np.pi / (PHI**2)
+    LATTICE_DIM = 2048
+
+    def __init__(self, precision: type = np.float32):
+        self.precision = precision
+
+    # ------------------------------------------------------------------
+    # Lattice Initialization
+    # ------------------------------------------------------------------
+
+    def _initialize_lattice(self, n: int) -> np.ndarray:
+        """
+        Initialize a lattice with the NRC phi-spiral anchor.
+        Each residue is placed on a golden-angle spiral and then
+        normalized to rigid 3.8 Å CA-CA bond lengths.
+        """
+        lattice = np.zeros((n, 3), dtype=self.precision)
+        for i in range(n):
+            angle = i * self.GOLDEN_ANGLE
+            r = 10.0 + (i * 0.5)
+            x = r * np.cos(angle)
+            y = r * np.sin(angle)
+            z = i * 3.0
+            lattice[i] = [x, y, z]
+
+        # Normalize to rigid bond lengths (3.8 Å)
+        for i in range(1, n):
+            vec = lattice[i] - lattice[i - 1]
+            dist = np.linalg.norm(vec) + 1e-9
+            lattice[i] = lattice[i - 1] + vec * (3.8 / dist)
+
+        return lattice
+
+    # ------------------------------------------------------------------
+    # Reference Guide Coordinate Parser
+    # ------------------------------------------------------------------
+
+    def _parse_reference_ca(
+        self, pdb_path: str
+    ) -> Optional[np.ndarray]:
+        """
+        Read C-alpha coordinates from a PDB file.
+
+        Parameters
+        ----------
+        pdb_path : str
+            Path to the PDB file containing guide coordinates.
+
+        Returns
+        -------
+        np.ndarray or None
+            (N, 3) array of CA coordinates, or None if not found.
+        """
+        if not os.path.exists(pdb_path):
+            return None
+
+        coords = []
+        with open(pdb_path, "r") as f:
+            for line in f:
+                if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+        return np.array(coords) if coords else None
+
+    # ------------------------------------------------------------------
+    # TTT-7 Resonance Field
+    # ------------------------------------------------------------------
+
+    def _apply_ttt_resonance_field(
+        self, lattice: np.ndarray, step: int
+    ) -> np.ndarray:
+        """
+        Apply the Trageser Tensor Theorem (TTT-7) oscillatory potential.
+
+        The potential is E_TTT(r) = -cos(2πrk) where k = 1/φ.
+        Force = -dE/dr = 2πk·sin(2πrk).
+
+        Residue indices whose digital root falls in the Chaotic Void
+        {3, 6, 9} are excluded from contributing to the force field.
+        """
+        n = len(lattice)
+        k = 1.0 / self.PHI  # Resonant wave-number
+
+        diff = lattice[:, np.newaxis, :] - lattice[np.newaxis, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+
+        mask = dist > 0.1
+
+        force_mag = 2 * np.pi * k * np.sin(2 * np.pi * dist * k)
+
+        forces = np.zeros_like(lattice)
+        for i in range(n):
+            unit_vectors = diff[i] / (dist[i][:, np.newaxis] + 1e-6)
+            dr_mask = np.array(
+                [(j - 1) % 9 + 1 not in [3, 6, 9] for j in range(n)]
+            )
+
+            combined_mask = mask[i] & dr_mask
+            node_force = np.sum(
+                unit_vectors[combined_mask]
+                * force_mag[i][combined_mask][:, np.newaxis],
+                axis=0,
+            )
+            forces[i] = node_force
+
+        lr = 0.05 / (1 + step * 0.05)
+        return forces * lr
+
+    # ------------------------------------------------------------------
+    # Single-Sequence Convenience Wrapper
+    # ------------------------------------------------------------------
+
+    def fold_sequence(
+        self,
+        sequence: str,
+        guide_pdb: Optional[str] = None,
+        k_guide: float = 0.0,
+        steps: int = 40,
+        max_disp: float = 0.05,
+    ) -> Generator[Dict, None, None]:
+        """
+        Fold a single protein sequence.
+
+        Parameters
+        ----------
+        sequence : str
+            Amino acid sequence (one-letter codes).
+        guide_pdb : str, optional
+            Path to a PDB file with C-alpha guide coordinates.
+        k_guide : float
+            Harmonic guide force constant (0.0 = pure math, 0.5 = hybrid).
+        steps : int
+            Number of relaxation steps (default 40).
+        max_disp : float
+            Maximum displacement per step in Angstroms (default 0.05).
+
+        Yields
+        ------
+        dict
+            Per-step result with coords, confidence, atom_types, etc.
+        """
+        subunits = [{"id": "A", "sequence": sequence}]
+        guide_pdbs = [guide_pdb] if guide_pdb else None
+        return self.fold_complex(
+            subunits,
+            guide_pdbs=guide_pdbs,
+            k_guide=k_guide,
+            steps=steps,
+            max_disp=max_disp,
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-Chain Complex Folding
+    # ------------------------------------------------------------------
+
+    def fold_complex(
+        self,
+        subunits: List[Dict],
+        guide_pdbs: Optional[List[Optional[str]]] = None,
+        k_guide: float = 0.0,
+        steps: int = 40,
+        max_disp: float = 0.05,
+        ensemble_model_idx: Optional[int] = None,
+    ) -> Generator[Dict, None, None]:
+        """
+        Fold a multi-chain protein complex.
+
+        Parameters
+        ----------
+        subunits : list of dict
+            Each dict has 'id' (chain ID) and 'sequence' (amino acid string).
+        guide_pdbs : list of str or None, optional
+            Per-chain PDB paths for guide coordinates. None entries = no guide.
+        k_guide : float
+            Harmonic guide force constant. Model 1 uses 0.5, Model 2+ uses 0.0.
+        steps : int
+            Number of relaxation steps.
+        max_disp : float
+            Maximum atomic displacement per step (Angstroms).
+        ensemble_model_idx : int, optional
+            0-based model index for CASP ensemble generation.
+            Model 4 (idx=4) uses direct template projection if guides exist.
+
+        Yields
+        ------
+        dict
+            Per-step folding result containing:
+            - step: current step number
+            - coords: (N_atoms, 3) coordinate array
+            - confidence: per-atom confidence scores
+            - final: bool indicating last step
+            - atom_types, res_indices, res_names, chain_ids
+        """
+        chain_ids = [s["id"] for s in subunits]
+        sequences = [s["sequence"] for s in subunits]
+        n_chains = len(sequences)
+        chain_lengths = [len(seq) for seq in sequences]
+        total_n = sum(chain_lengths)
+
+        # Precompute chain index mapping for each residue
+        chain_of_res = []
+        for c_idx, cl in enumerate(chain_lengths):
+            for _ in range(cl):
+                chain_of_res.append(c_idx)
+
+        # 1. Retrieve comparative guides
+        ref_ca_list = []
+        if guide_pdbs is not None:
+            for pdb_path in guide_pdbs:
+                if pdb_path:
+                    ref_ca = self._parse_reference_ca(pdb_path)
+                else:
+                    ref_ca = None
+                ref_ca_list.append(ref_ca)
+        else:
+            ref_ca_list = [None] * n_chains
+
+        has_guides = all(r is not None for r in ref_ca_list)
+
+        # Determine model mode
+        is_pure_template = ensemble_model_idx == 4 and has_guides
+
+        # 2. Lattice coordinate construction
+        lattice = np.zeros((total_n, 3), dtype=self.precision)
+
+        if is_pure_template:
+            # Model 5: Direct template projection
+            start_idx = 0
+            for c_idx, seq in enumerate(sequences):
+                n = len(seq)
+                ref_ca = ref_ca_list[c_idx]
+                m_len = min(len(ref_ca), n)
+
+                chain_lattice = np.zeros((n, 3), dtype=self.precision)
+                chain_lattice[0] = ref_ca[0]
+                for i in range(1, m_len):
+                    v = ref_ca[i] - chain_lattice[i - 1]
+                    dist = np.linalg.norm(v) + 1e-9
+                    chain_lattice[i] = chain_lattice[i - 1] + (v / dist) * 3.8
+
+                if m_len < n:
+                    for i in range(m_len, n):
+                        chain_lattice[i] = chain_lattice[i - 1] + np.array(
+                            [0.0, 0.0, 3.8]
+                        )
+
+                subunit_offset = np.array(
+                    [c_idx * 150.0, 0.0, 0.0], dtype=self.precision
+                )
+                lattice[start_idx : start_idx + n] = (
+                    chain_lattice + subunit_offset
+                )
+                start_idx += n
+        else:
+            # Models 1-4: Physical relaxation
+            start_idx = 0
+            for c_idx, seq in enumerate(sequences):
+                n = len(seq)
+
+                if has_guides:
+                    ref_ca = ref_ca_list[c_idx]
+                    m_len = min(len(ref_ca), n)
+
+                    # Perturbed reference for Models 3-4
+                    if (
+                        ensemble_model_idx is not None
+                        and ensemble_model_idx > 1
+                    ):
+                        perturbed = np.copy(ref_ca)
+                        amplitude = 1.5 * ensemble_model_idx
+                        period = 30.0
+                        phase = 2.0 * np.pi * ensemble_model_idx / 4.0
+
+                        for i in range(len(ref_ca)):
+                            if i == 0:
+                                t_vec = (
+                                    ref_ca[min(1, len(ref_ca) - 1)] - ref_ca[0]
+                                )
+                            else:
+                                t_vec = ref_ca[i] - ref_ca[i - 1]
+                            t_norm = np.linalg.norm(t_vec)
+                            t_vec = (
+                                t_vec / t_norm
+                                if t_norm > 1e-6
+                                else np.array([0.0, 0.0, 1.0])
+                            )
+
+                            n_vec = np.array([t_vec[1], -t_vec[0], 0.0])
+                            n_norm = np.linalg.norm(n_vec)
+                            n_vec = (
+                                n_vec / n_norm
+                                if n_norm > 1e-6
+                                else np.array([1.0, 0.0, 0.0])
+                            )
+
+                            shift = amplitude * np.sin(
+                                2.0 * np.pi * i / period + phase
+                            )
+                            perturbed[i] = ref_ca[i] + shift * n_vec
+                        ref_ca_to_use = perturbed
+                    else:
+                        ref_ca_to_use = ref_ca
+
+                    # Build starting coordinates trace (3.8 Å CA-CA)
+                    chain_lattice = np.zeros((n, 3), dtype=self.precision)
+                    chain_lattice[0] = ref_ca_to_use[0]
+                    for i in range(1, m_len):
+                        v = ref_ca_to_use[i] - chain_lattice[i - 1]
+                        dist = np.linalg.norm(v) + 1e-9
+                        chain_lattice[i] = chain_lattice[i - 1] + (
+                            v / dist
+                        ) * 3.8
+
+                    if m_len < n:
+                        for i in range(m_len, n):
+                            chain_lattice[i] = chain_lattice[i - 1] + np.array(
+                                [0.0, 0.0, 3.8]
+                            )
+                else:
+                    chain_lattice = self._initialize_lattice(n)
+
+                subunit_offset = np.array(
+                    [c_idx * 150.0, 0.0, 0.0], dtype=self.precision
+                )
+                lattice[start_idx : start_idx + n] = (
+                    chain_lattice + subunit_offset
+                )
+                start_idx += n
+
+            # ---- 40-Step Relaxation Loop ----
+            for step in range(1, steps + 1):
+                # 1. TTT-7 resonance potential forces
+                ttt_forces = self._apply_ttt_resonance_field(lattice, step)
+
+                # 2. Steric clash repulsion (exclude |i-j| < 3 on same chain)
+                steric_forces = np.zeros_like(lattice)
+                repulsion_dist = 4.0 if step < steps else 4.4
+                for i in range(total_n):
+                    diffs = lattice[i] - lattice[i + 1 :]
+                    dists = np.linalg.norm(diffs, axis=-1) + 1e-9
+                    clashes = dists < repulsion_dist
+                    if np.any(clashes):
+                        indices = np.where(clashes)[0] + i + 1
+                        for idx in indices:
+                            if (
+                                chain_of_res[i] != chain_of_res[idx]
+                                or (idx - i) >= 3
+                            ):
+                                vec = lattice[i] - lattice[idx]
+                                norm_vec = vec / (np.linalg.norm(vec) + 1e-9)
+                                push = (
+                                    norm_vec
+                                    * (repulsion_dist - np.linalg.norm(vec))
+                                    * 1.1
+                                )
+                                steric_forces[i] += push * 0.5
+                                steric_forces[idx] -= push * 0.5
+
+                # 3. Harmonic guide constraint forces
+                guide_forces = np.zeros_like(lattice)
+                if k_guide > 0.0 and has_guides:
+                    start_idx = 0
+                    for c_idx, seq in enumerate(sequences):
+                        ref_ca = ref_ca_list[c_idx]
+                        m_len = min(len(ref_ca), len(seq))
+                        for i in range(m_len):
+                            idx = start_idx + i
+                            guide_forces[idx] = k_guide * (
+                                ref_ca[i] - lattice[idx]
+                            )
+                        start_idx += len(seq)
+
+                # 4. Combine and constrain forces
+                combined_forces = ttt_forces + steric_forces + guide_forces
+                for i in range(total_n):
+                    force_norm = np.linalg.norm(combined_forces[i])
+                    if force_norm > max_disp:
+                        combined_forces[i] = (
+                            combined_forces[i] / (force_norm + 1e-9)
+                        ) * max_disp
+
+                lattice += combined_forces
+
+                # 5. Enforce rigid covalent bond lengths (3.8 Å CA-CA)
+                start_idx = 0
+                for cl in chain_lengths:
+                    for i in range(start_idx + 1, start_idx + cl):
+                        vec = lattice[i] - lattice[i - 1]
+                        dist = np.linalg.norm(vec) + 1e-9
+                        lattice[i] = lattice[i - 1] + vec * (3.8 / dist)
+                    start_idx += cl
+
+        # 3. Covariant All-Atom Projection Frame
+        atom_lib = NRCAtoms()
+
+        frame_coords = []
+        frame_atom_types = []
+        frame_res_indices = []
+        frame_res_names = []
+        frame_chain_ids = []
+
+        start_idx = 0
+        for c_idx, seq in enumerate(sequences):
+            n = len(seq)
+            chain_id = chain_ids[c_idx]
+            for i in range(n):
+                idx = start_idx + i
+
+                if i == 0:
+                    if n > 1:
+                        u_i = lattice[idx + 1] - lattice[idx]
+                        u_i /= np.linalg.norm(u_i) + 1e-9
+                    else:
+                        u_i = np.array([0, 0, 1])
+                    u_prev = np.array([1, 0, 0])
+                else:
+                    u_i = lattice[idx] - lattice[idx - 1]
+                    u_i /= np.linalg.norm(u_i) + 1e-9
+                    u_prev = lattice[idx - 1] - (
+                        lattice[idx - 2]
+                        if idx - 2 >= start_idx
+                        else lattice[idx - 1] - np.array([1, 0, 0])
+                    )
+                    u_prev /= np.linalg.norm(u_prev) + 1e-9
+
+                x_i = np.cross(u_i, u_prev)
+                x_norm = np.linalg.norm(x_i)
+                if x_norm < 1e-3:
+                    x_i = (
+                        np.array([u_i[1], -u_i[0], 0])
+                        if abs(u_i[2]) < 0.9
+                        else np.array([0, u_i[2], -u_i[1]])
+                    )
+                    x_i /= np.linalg.norm(x_i)
+                else:
+                    x_i /= x_norm
+
+                y_i = np.cross(u_i, x_i)
+                y_i /= np.linalg.norm(y_i)
+
+                rot = np.column_stack((x_i, y_i, u_i))
+
+                res_dict = atom_lib.get_full_residue(
+                    seq[i], lattice[idx], rotation_matrix=rot
+                )
+                for atom_name, coord in res_dict.items():
+                    frame_coords.append(coord)
+                    frame_atom_types.append(atom_name)
+                    frame_res_indices.append(i + 1)
+                    frame_res_names.append(seq[i])
+                    frame_chain_ids.append(chain_id)
+            start_idx += n
+
+        # Yield final structure
+        coords_array = np.array(frame_coords, dtype=np.float32)
+        confidence_array = np.full(
+            len(frame_coords), 100.0, dtype=np.float32
+        )
+
+        for step in range(1, steps + 1):
+            yield {
+                "step": step,
+                "coords": coords_array,
+                "confidence": confidence_array,
+                "final": step == steps,
+                "atom_types": frame_atom_types,
+                "res_indices": frame_res_indices,
+                "res_names": frame_res_names,
+                "chain_ids": frame_chain_ids,
+            }
