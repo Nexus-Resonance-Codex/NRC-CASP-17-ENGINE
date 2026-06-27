@@ -32,6 +32,12 @@ from .ttt7 import TTT7Auditor
 from .reporting import ReportingSuite
 from .deposition import depositor
 
+from .geometry import fragment_based_initialization, reconstruct_backbone_frames_t, reconstruct_backbone_frames_np, reconstruct_frenet_frames_np
+from .energy import NRCPotential
+from .optimizer import NRCOptimizer
+from .validation import benchmark_folding
+
+
 __all__ = [
     "NRCEngine",
     "NRCForcefield",
@@ -41,4 +47,11 @@ __all__ = [
     "TTT7Auditor",
     "ReportingSuite",
     "depositor",
+    "fragment_based_initialization",
+    "reconstruct_backbone_frames_t",
+    "reconstruct_backbone_frames_np",
+    "reconstruct_frenet_frames_np",
+    "NRCPotential",
+    "NRCOptimizer",
+    "benchmark_folding",
 ]

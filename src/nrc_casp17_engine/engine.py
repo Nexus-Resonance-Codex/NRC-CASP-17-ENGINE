@@ -23,6 +23,7 @@ import os
 from typing import List, Dict, Optional, Generator
 
 from .atoms import NRCAtoms
+from .geometry import reconstruct_frenet_frames_np
 
 
 class NRCEngine:
@@ -474,45 +475,15 @@ class NRCEngine:
         for c_idx, seq in enumerate(sequences):
             n = len(seq)
             chain_id = chain_ids[c_idx]
+            
+            # Precompute Frenet frames for this chain
+            chain_coords = lattice[start_idx : start_idx + n]
+            rot = reconstruct_frenet_frames_np(chain_coords, start_idx=0)
+            
             for i in range(n):
                 idx = start_idx + i
-
-                if i == 0:
-                    if n > 1:
-                        u_i = lattice[idx + 1] - lattice[idx]
-                        u_i /= np.linalg.norm(u_i) + 1e-9
-                    else:
-                        u_i = np.array([0, 0, 1])
-                    u_prev = np.array([1, 0, 0])
-                else:
-                    u_i = lattice[idx] - lattice[idx - 1]
-                    u_i /= np.linalg.norm(u_i) + 1e-9
-                    u_prev = lattice[idx - 1] - (
-                        lattice[idx - 2]
-                        if idx - 2 >= start_idx
-                        else lattice[idx - 1] - np.array([1, 0, 0])
-                    )
-                    u_prev /= np.linalg.norm(u_prev) + 1e-9
-
-                x_i = np.cross(u_i, u_prev)
-                x_norm = np.linalg.norm(x_i)
-                if x_norm < 1e-3:
-                    x_i = (
-                        np.array([u_i[1], -u_i[0], 0])
-                        if abs(u_i[2]) < 0.9
-                        else np.array([0, u_i[2], -u_i[1]])
-                    )
-                    x_i /= np.linalg.norm(x_i)
-                else:
-                    x_i /= x_norm
-
-                y_i = np.cross(u_i, x_i)
-                y_i /= np.linalg.norm(y_i)
-
-                rot = np.column_stack((x_i, y_i, u_i))
-
                 res_dict = atom_lib.get_full_residue(
-                    seq[i], lattice[idx], rotation_matrix=rot
+                    seq[i], lattice[idx], rotation_matrix=rot[i]
                 )
                 for atom_name, coord in res_dict.items():
                     frame_coords.append(coord)
