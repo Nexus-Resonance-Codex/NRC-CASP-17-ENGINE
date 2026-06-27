@@ -29,6 +29,8 @@ from .atoms import NRCAtoms
 from .chemistry import NRCChemistry
 from .biophysics import BiophysicsSuite
 from .ttt7 import TTT7Auditor
+from .reporting import ReportingSuite
+from .deposition import depositor
 
 __all__ = [
     "NRCEngine",
@@ -37,4 +39,6 @@ __all__ = [
     "NRCChemistry",
     "BiophysicsSuite",
     "TTT7Auditor",
+    "ReportingSuite",
+    "depositor",
 ]
