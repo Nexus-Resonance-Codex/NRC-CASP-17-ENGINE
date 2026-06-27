@@ -1,12 +1,13 @@
 """
-NRC Forcefield — L-BFGS-B Optimized All-Atom Energy Minimization
+NRC Forcefield — PyTorch-Accelerated All-Atom Energy Minimization
 ================================================================
 
-Implements a complete ab initio thermodynamic potential function with analytical gradients:
+Implements a complete ab initio thermodynamic potential function with PyTorch autograd:
 - Chou-Fasman secondary structure propensities
 - Kyte-Doolittle hydrophobic collapse
 - TTT-7 resonance & Tesla 3-6-9 exclusion
 - Screened Coulomb electrostatics
+- Directional hydrogen bonding (N-H...O-C) with explicit angles (Option 2)
 - Local pseudo-dihedral distance constraints
 - Radius of gyration confinement
 """
@@ -14,6 +15,7 @@ Implements a complete ab initio thermodynamic potential function with analytical
 import numpy as np
 import os
 import json
+import torch
 from scipy.optimize import minimize
 
 from .chemistry import NRCChemistry
@@ -92,6 +94,11 @@ class NRCForcefield:
         # Seed coordinates on uniform spherical Fibonacci spiral
         self.x0 = self.spherical_fibonacci_initialization(self.N_res)
 
+        # Relative backbone coordinates to CA
+        self.r_N_rel = torch.tensor([-1.46, 0.0, 0.0], dtype=torch.float64)
+        self.r_C_rel = torch.tensor([1.52, 0.0, 0.0], dtype=torch.float64)
+        self.r_O_rel = torch.tensor([2.15, 1.0, 0.0], dtype=torch.float64)
+
     def spherical_fibonacci_initialization(self, N: int) -> np.ndarray:
         """uniform points on sphere using Fibonacci spiral."""
         indices = np.arange(1, N + 1)
@@ -103,160 +110,187 @@ class NRCForcefield:
 
     def energy_and_gradient(self, coords_flat: np.ndarray) -> tuple:
         """
-        Total energy and gradient calculation. All interactions are vectorized in CA space.
+        Total energy and gradient calculation using PyTorch autograd.
         """
-        coords = coords_flat.reshape(-1, 3)
+        coords_t = torch.tensor(coords_flat, dtype=torch.float64, requires_grad=True)
+        energy_t = self._compute_energy_t(coords_t)
+        
+        # Compute backward gradients
+        energy_t.backward()
+        grad = coords_t.grad.detach().numpy()
+        
+        return energy_t.item(), grad
+
+    def _compute_energy_t(self, coords_t: torch.Tensor) -> torch.Tensor:
+        coords = coords_t.view(-1, 3)
         N = coords.shape[0]
-        grad = np.zeros_like(coords)
-        total_e = 0.0
+        total_e = torch.tensor(0.0, dtype=torch.float64)
 
         # 1. Harmonic Backbone Constraints (i to i+1)
         diff_bond = coords[1:] - coords[:-1]
-        d_bond = np.linalg.norm(diff_bond, axis=1) + 1e-9
-        bond_e = self.weights["bond"] * np.sum((d_bond - 3.8)**2)
-        total_e += bond_e
-
-        bond_mag = 2 * self.weights["bond"] * (d_bond - 3.8) / d_bond
-        grad[:-1] += -bond_mag[:, np.newaxis] * diff_bond
-        grad[1:] += bond_mag[:, np.newaxis] * diff_bond
+        d_bond = torch.norm(diff_bond, dim=1)
+        bond_e = self.weights["bond"] * torch.sum((d_bond - 3.8)**2)
+        total_e = total_e + bond_e
 
         # Non-bonded terms mask (j - i >= 3)
         mask = np.triu(np.ones((N, N), dtype=bool), k=3)
         if np.any(mask):
             idx_i, idx_j = np.where(mask)
             diff_nb = coords[idx_i] - coords[idx_j]
-            d_nb = np.linalg.norm(diff_nb, axis=1) + 1e-9
+            d_nb = torch.norm(diff_nb, dim=1) + 1e-9
 
             # 2. Steric repulsion (clash check)
             clash_mask = d_nb < 4.0
-            if np.any(clash_mask):
-                d_clash = d_nb[clash_mask]
-                diff_clash = diff_nb[clash_mask]
-                steric_e = self.weights["steric"] * np.sum((4.0 - d_clash)**2)
-                total_e += steric_e
-
-                steric_mag = -2 * self.weights["steric"] * (4.0 - d_clash) / d_clash
-                np.add.at(grad, idx_i[clash_mask], steric_mag[:, np.newaxis] * diff_clash)
-                np.add.at(grad, idx_j[clash_mask], -steric_mag[:, np.newaxis] * diff_clash)
+            if torch.any(clash_mask):
+                steric_e = self.weights["steric"] * torch.sum((4.0 - d_nb[clash_mask])**2)
+                total_e = total_e + steric_e
 
             # 3. TTT-7 Resonance & Tesla 3-6-9 exclusion
             dr = d_nb * self.MODULAR_SCALE
             damping = 1.0 / (1.0 + 0.1 * d_nb**2)
-            void_penalty = self.weights["steric"] * damping * (1.0 + np.cos(2 * np.pi * dr / 3.0))
-            total_e += np.sum(void_penalty)
-
-            p_grad_periodic = -self.weights["steric"] * damping * (2 * np.pi / 3.0) * np.sin(2 * np.pi * dr / 3.0) * self.MODULAR_SCALE
-            p_grad_damping = -self.weights["steric"] * (1.0 + np.cos(2 * np.pi * dr / 3.0)) * (0.2 * d_nb) * (damping**2)
-            p_grad_total = p_grad_periodic + p_grad_damping
+            void_penalty = self.weights["steric"] * torch.sum(damping * (1.0 + torch.cos(2 * np.pi * dr / 3.0)))
+            total_e = total_e + void_penalty
 
             ttt_factor = 2 * np.pi / 9.0
-            ttt_e = -self.weights["ttt7"] * np.cos(ttt_factor * (dr - 7.0))
-            total_e += np.sum(ttt_e)
-            ttt_grad_mag = self.weights["ttt7"] * ttt_factor * np.sin(ttt_factor * (dr - 7.0)) * self.MODULAR_SCALE
-
-            nb_mag = (p_grad_total + ttt_grad_mag) / d_nb
-            np.add.at(grad, idx_i, nb_mag[:, np.newaxis] * diff_nb)
-            np.add.at(grad, idx_j, -nb_mag[:, np.newaxis] * diff_nb)
+            ttt_e = -self.weights["ttt7"] * torch.sum(torch.cos(ttt_factor * (dr - 7.0)))
+            total_e = total_e + ttt_e
 
             # 4. Hydrophobic collapse
-            h_i = self.h_pos[idx_i]
-            h_j = self.h_pos[idx_j]
-            h_prod = h_i * h_j
-            if np.any(h_prod > 0):
-                exp_term = np.exp(-0.5 * (d_nb - 4.5)**2)
-                hydro_e = self.weights["hydro"] * np.sum(-h_prod * exp_term)
-                total_e += hydro_e
-
-                hydro_mag = self.weights["hydro"] * h_prod * (d_nb - 4.5) * exp_term / d_nb
-                np.add.at(grad, idx_i, hydro_mag[:, np.newaxis] * diff_nb)
-                np.add.at(grad, idx_j, -hydro_mag[:, np.newaxis] * diff_nb)
+            h_prod = torch.tensor(self.h_pos[idx_i] * self.h_pos[idx_j], dtype=torch.float64)
+            exp_term = torch.exp(-0.5 * (d_nb - 4.5)**2)
+            hydro_e = self.weights["hydro"] * torch.sum(-h_prod * exp_term)
+            total_e = total_e + hydro_e
 
             # 5. Coulomb electrostatics
-            q_i = self.charges[idx_i]
-            q_j = self.charges[idx_j]
-            q_prod = q_i * q_j
-            if np.any(q_prod != 0):
-                elec_e = self.weights["elec"] * np.sum(q_prod / d_nb**2)
-                total_e += elec_e
+            q_prod = torch.tensor(self.charges[idx_i] * self.charges[idx_j], dtype=torch.float64)
+            elec_e = self.weights["elec"] * torch.sum(q_prod / d_nb**2)
+            total_e = total_e + elec_e
 
-                elec_mag = -2 * self.weights["elec"] * q_prod / d_nb**4
-                np.add.at(grad, idx_i, elec_mag[:, np.newaxis] * diff_nb)
-                np.add.at(grad, idx_j, -elec_mag[:, np.newaxis] * diff_nb)
-
-            # 6. Hydrogen bonding sheet (long range attraction with Gaussian localization)
-            p_beta_prod = self.p_beta[idx_i] * self.p_beta[idx_j]
-            if np.any(p_beta_prod > 0):
-                diff_target = d_nb - 4.8
-                exp_term = np.exp(-0.25 * diff_target**2)
-                sheet_e = self.weights["sheet"] * np.sum(p_beta_prod * diff_target**2 * exp_term)
-                total_e += sheet_e
-
-                f_prime = diff_target * exp_term * (2.0 - 0.5 * diff_target**2)
-                sheet_mag = self.weights["sheet"] * p_beta_prod * f_prime / d_nb
-                np.add.at(grad, idx_i, sheet_mag[:, np.newaxis] * diff_nb)
-                np.add.at(grad, idx_j, -sheet_mag[:, np.newaxis] * diff_nb)
-
-        # 7. Local pseudo-torsions (distances i to i+2 and i to i+3)
+        # 6. Local pseudo-torsions (distances i to i+2 and i to i+3)
         if N > 2:
-            idx_i = np.arange(N - 2)
-            idx_k = idx_i + 2
-            diff_2 = coords[idx_i] - coords[idx_k]
-            d_2 = np.linalg.norm(diff_2, axis=1) + 1e-9
+            idx_i2 = np.arange(N - 2)
+            idx_k2 = idx_i2 + 2
+            diff_2 = coords[idx_i2] - coords[idx_k2]
+            d_2 = torch.norm(diff_2, dim=1)
 
-            p_alpha_local = (self.p_alpha[idx_i] + self.p_alpha[idx_i+1] + self.p_alpha[idx_k]) / 3.0
-            p_beta_local = (self.p_beta[idx_i] + self.p_beta[idx_i+1] + self.p_beta[idx_k]) / 3.0
+            p_alpha_local2 = torch.tensor((self.p_alpha[idx_i2] + self.p_alpha[idx_i2+1] + self.p_alpha[idx_k2]) / 3.0, dtype=torch.float64)
+            p_beta_local2 = torch.tensor((self.p_beta[idx_i2] + self.p_beta[idx_i2+1] + self.p_beta[idx_k2]) / 3.0, dtype=torch.float64)
 
-            term_alpha = p_alpha_local * (d_2 - 5.4)**2
-            term_beta = p_beta_local * (d_2 - 6.6)**2
-            torsion_2_e = self.weights["torsion"] * np.sum(term_alpha + term_beta)
-            total_e += torsion_2_e
-
-            mag_2 = 2 * self.weights["torsion"] * (p_alpha_local * (d_2 - 5.4) + p_beta_local * (d_2 - 6.6)) / d_2
-            np.add.at(grad, idx_i, mag_2[:, np.newaxis] * diff_2)
-            np.add.at(grad, idx_k, -mag_2[:, np.newaxis] * diff_2)
+            torsion_2_e = self.weights["torsion"] * torch.sum(p_alpha_local2 * (d_2 - 5.4)**2 + p_beta_local2 * (d_2 - 6.6)**2)
+            total_e = total_e + torsion_2_e
 
         if N > 3:
-            idx_i = np.arange(N - 3)
-            idx_k = idx_i + 3
-            diff_3 = coords[idx_i] - coords[idx_k]
-            d_3 = np.linalg.norm(diff_3, axis=1) + 1e-9
+            idx_i3 = np.arange(N - 3)
+            idx_k3 = idx_i3 + 3
+            diff_3 = coords[idx_i3] - coords[idx_k3]
+            d_3 = torch.norm(diff_3, dim=1)
 
-            p_alpha_local = (self.p_alpha[idx_i] + self.p_alpha[idx_i+1] + self.p_alpha[idx_i+2] + self.p_alpha[idx_k]) / 4.0
-            p_beta_local = (self.p_beta[idx_i] + self.p_beta[idx_i+1] + self.p_beta[idx_i+2] + self.p_beta[idx_k]) / 4.0
+            p_alpha_local3 = torch.tensor((self.p_alpha[idx_i3] + self.p_alpha[idx_i3+1] + self.p_alpha[idx_i3+2] + self.p_alpha[idx_k3]) / 4.0, dtype=torch.float64)
+            p_beta_local3 = torch.tensor((self.p_beta[idx_i3] + self.p_beta[idx_i3+1] + self.p_beta[idx_i3+2] + self.p_beta[idx_k3]) / 4.0, dtype=torch.float64)
 
-            term_alpha = p_alpha_local * (d_3 - 5.1)**2
-            term_beta = p_beta_local * (d_3 - 9.8)**2
-            torsion_3_e = self.weights["torsion"] * np.sum(term_alpha + term_beta)
-            total_e += torsion_3_e
+            torsion_3_e = self.weights["torsion"] * torch.sum(p_alpha_local3 * (d_3 - 5.1)**2 + p_beta_local3 * (d_3 - 9.8)**2)
+            total_e = total_e + torsion_3_e
 
-            mag_3 = 2 * self.weights["torsion"] * (p_alpha_local * (d_3 - 5.1) + p_beta_local * (d_3 - 9.8)) / d_3
-            np.add.at(grad, idx_i, mag_3[:, np.newaxis] * diff_3)
-            np.add.at(grad, idx_k, -mag_3[:, np.newaxis] * diff_3)
+        # 7. Directional Hydrogen Bonding Potential (Option 2)
+        # 7a. Reconstruct local backbone coordinate frames
+        if N > 2:
+            v_prev = coords[1:] - coords[:-1]
+            d_prev = torch.norm(v_prev, dim=1, keepdim=True) + 1e-9
+            u_prev = v_prev / d_prev
 
-        # 8. Helix i to i+4 Hydrogen bonding
-        if N > 4:
-            idx_i = np.arange(N - 4)
-            idx_k = idx_i + 4
-            diff_4 = coords[idx_i] - coords[idx_k]
-            d_4 = np.linalg.norm(diff_4, axis=1) + 1e-9
+            t = u_prev[:-1] + u_prev[1:]
+            t = t / (torch.norm(t, dim=1, keepdim=True) + 1e-9)
 
-            p_alpha_prod = self.p_alpha[idx_i] * self.p_alpha[idx_k]
-            helix_e = self.weights["helix"] * np.sum(p_alpha_prod * (d_4 - 6.2)**2)
-            total_e += helix_e
+            n = torch.cross(u_prev[:-1], u_prev[1:], dim=1)
+            n = n / (torch.norm(n, dim=1, keepdim=True) + 1e-9)
 
-            mag_4 = 2 * self.weights["helix"] * p_alpha_prod * (d_4 - 6.2) / d_4
-            np.add.at(grad, idx_i, mag_4[:, np.newaxis] * diff_4)
-            np.add.at(grad, idx_k, -mag_4[:, np.newaxis] * diff_4)
+            b = torch.cross(t, n, dim=1)
+            rot_mid = torch.stack([t, n, b], dim=2)
+            
+            # Pad boundaries (rot is N x 3 x 3)
+            rot = torch.cat([rot_mid[0:1], rot_mid, rot_mid[-1:]], dim=0)
+        else:
+            rot = torch.eye(3, dtype=torch.float64).expand(N, 3, 3)
 
-        # 9. Radius of Gyration
-        mean_coords = np.mean(coords, axis=0)
+        # 7b. Reconstruct N, C, O backbone positions
+        r_N = coords + torch.matmul(rot, self.r_N_rel)
+        r_C = coords + torch.matmul(rot, self.r_C_rel)
+        r_O = coords + torch.matmul(rot, self.r_O_rel)
+
+        # 7c. Reconstruct amide hydrogen H (for residues i >= 1)
+        if N > 1:
+            u_NC = r_C[:-1] - r_N[1:]
+            u_NC = u_NC / (torch.norm(u_NC, dim=1, keepdim=True) + 1e-9)
+            u_NCA = coords[1:] - r_N[1:]
+            u_NCA = u_NCA / (torch.norm(u_NCA, dim=1, keepdim=True) + 1e-9)
+            v_H = u_NC + u_NCA
+            r_H_mid = r_N[1:] + 1.0 * v_H / (torch.norm(v_H, dim=1, keepdim=True) + 1e-9)
+            # Pad H[0] with H[1] position
+            r_H = torch.cat([r_H_mid[0:1], r_H_mid], dim=0)
+        else:
+            r_H = coords.clone()
+
+        # 7d. Evaluate H-bonds between donor i (i >= 1) and acceptor j
+        donor_idx = torch.arange(1, N)
+        acceptor_idx = torch.arange(0, N)
+        d_i, a_j = torch.meshgrid(donor_idx, acceptor_idx, indexing="ij")
+        
+        # Exclude local interactions |i - j| < 3
+        pair_mask = torch.abs(d_i - a_j) >= 3
+        if torch.any(pair_mask):
+            d_i_flat = d_i[pair_mask]
+            a_j_flat = a_j[pair_mask]
+
+            N_coords = r_N[d_i_flat]
+            H_coords = r_H[d_i_flat]
+            C_coords = r_C[a_j_flat]
+            O_coords = r_O[a_j_flat]
+
+            # NH bond unit vector
+            u_NH = H_coords - N_coords
+            u_NH = u_NH / (torch.norm(u_NH, dim=1, keepdim=True) + 1e-9)
+
+            # CO bond unit vector
+            u_CO = O_coords - C_coords
+            u_CO = u_CO / (torch.norm(u_CO, dim=1, keepdim=True) + 1e-9)
+
+            # OH vector and distance
+            v_OH = H_coords - O_coords
+            r_OH = torch.norm(v_OH, dim=1) + 1e-9
+            e_OH = v_OH / r_OH.unsqueeze(1)
+
+            # Alignment cosines
+            cos_D = torch.sum(u_NH * e_OH, dim=1)
+            cos_A = torch.sum(u_CO * (-e_OH), dim=1)
+
+            # Enforce positive cosines only (angle < 90 degrees)
+            cos_D_clamp = torch.clamp(cos_D, min=0.0)
+            cos_A_clamp = torch.clamp(cos_A, min=0.0)
+
+            # Gaussian potential at 1.8 A
+            V_attr = -5.0 * torch.exp(-0.5 * (r_OH - 1.8)**2)
+            raw_hb_e = V_attr * (cos_D_clamp**2) * (cos_A_clamp**2)
+
+            # Helix vs Sheet selection
+            is_helix_pair = torch.abs(d_i_flat - a_j_flat) == 4
+            p_alpha_t = torch.tensor(self.p_alpha, dtype=torch.float64)
+            p_beta_t = torch.tensor(self.p_beta, dtype=torch.float64)
+
+            w_helix_pair = self.weights["helix"] * p_alpha_t[d_i_flat] * p_alpha_t[a_j_flat]
+            w_sheet_pair = self.weights["sheet"] * p_beta_t[d_i_flat] * p_beta_t[a_j_flat]
+            hb_weights = torch.where(is_helix_pair, w_helix_pair, w_sheet_pair)
+
+            hb_e = torch.sum(hb_weights * raw_hb_e)
+            total_e = total_e + hb_e
+
+        # 8. Radius of Gyration Confinement
+        mean_coords = torch.mean(coords, dim=0)
         rel_coords = coords - mean_coords
-        rg = np.sqrt(np.mean(np.sum(rel_coords**2, axis=1)) + 1e-9)
+        rg = torch.sqrt(torch.mean(torch.sum(rel_coords**2, dim=1)) + 1e-9)
         conf_e = self.weights["rg"] * (rg - self.RG_TARGET)**2
-        total_e += conf_e
-        grad += (2.0 * self.weights["rg"] * (rg - self.RG_TARGET) / (rg * N + 1e-9)) * rel_coords
+        total_e = total_e + conf_e
 
-        return total_e, grad.flatten()
+        return total_e
 
     def optimize(self, max_iter: int = 500) -> np.ndarray:
         """Run L-BFGS-B minimization."""
