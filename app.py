@@ -17,10 +17,13 @@ if os.environ.get("SPACE_ID"):
 for d in ["/tmp/gradio_meta", "/tmp/gradio_cache", "/tmp/matplotlib_cache"]:
     os.makedirs(d, exist_ok=True)
 
-# Add the app directory to sys.path
+# Add the app directory and src directory to sys.path
 app_dir = os.path.dirname(os.path.abspath(__file__))
 if app_dir not in sys.path:
     sys.path.insert(0, app_dir)
+src_dir = os.path.join(app_dir, "src")
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 
 try:
     import audioop
