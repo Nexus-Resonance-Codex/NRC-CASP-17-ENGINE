@@ -43,9 +43,11 @@ class NRCForcefield:
         "H": -3.2, "E": -3.5, "Q": -3.5, "D": -3.5, "N": -3.5, "K": -3.9, "R": -4.5
     }
 
-    def __init__(self, sequence: str, weights: dict = None):
+    def __init__(self, sequence: str, weights: dict = None, contacts: list = None):
         self.sequence = sequence
         self.N_res = len(sequence)
+        self.contacts = contacts
+
         self.phi = (1 + np.sqrt(5)) / 2
 
         self.chem = NRCChemistry()
@@ -61,7 +63,8 @@ class NRCForcefield:
             "sheet": 10.0,
             "torsion": 25.0,
             "elec": 5.0,
-            "rg": 100.0
+            "rg": 100.0,
+            "contact": 50.0
         }
 
         # Try loading calibrated weights
@@ -290,7 +293,22 @@ class NRCForcefield:
         conf_e = self.weights["rg"] * (rg - self.RG_TARGET)**2
         total_e = total_e + conf_e
 
+        # 9. Co-evolution / Contact Map Restraints
+        if self.contacts is not None and len(self.contacts) > 0:
+            contact_indices_i = torch.tensor([c[0] for c in self.contacts], dtype=torch.long)
+            contact_indices_j = torch.tensor([c[1] for c in self.contacts], dtype=torch.long)
+            contact_targets = torch.tensor([c[2] if len(c) > 2 else 6.0 for c in self.contacts], dtype=torch.float64)
+            contact_weights = torch.tensor([c[3] if len(c) > 3 else 1.0 for c in self.contacts], dtype=torch.float64)
+
+            diff_c = coords[contact_indices_i] - coords[contact_indices_j]
+            d_c = torch.norm(diff_c, dim=1) + 1e-9
+
+            # Harmonic restraint pull
+            contact_e = torch.sum(contact_weights * (d_c - contact_targets)**2)
+            total_e = total_e + self.weights["contact"] * contact_e
+
         return total_e
+
 
     def optimize(self, max_iter: int = 500) -> np.ndarray:
         """Run L-BFGS-B minimization."""

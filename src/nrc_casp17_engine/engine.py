@@ -160,6 +160,7 @@ class NRCEngine:
         k_guide: float = 0.0,
         steps: int = 40,
         max_disp: float = 0.05,
+        contacts: Optional[list] = None,
     ) -> Generator[Dict, None, None]:
         """
         Fold a single protein sequence.
@@ -176,6 +177,8 @@ class NRCEngine:
             Number of relaxation steps (default 40).
         max_disp : float
             Maximum displacement per step in Angstroms (default 0.05).
+        contacts : list, optional
+            Residue-residue contact restraints for folding.
 
         Yields
         ------
@@ -190,7 +193,9 @@ class NRCEngine:
             k_guide=k_guide,
             steps=steps,
             max_disp=max_disp,
+            contacts=contacts,
         )
+
 
     # ------------------------------------------------------------------
     # Multi-Chain Complex Folding
@@ -204,6 +209,7 @@ class NRCEngine:
         steps: int = 40,
         max_disp: float = 0.05,
         ensemble_model_idx: Optional[int] = None,
+        contacts: Optional[list] = None,
     ) -> Generator[Dict, None, None]:
         """
         Fold a multi-chain protein complex.
@@ -301,10 +307,22 @@ class NRCEngine:
                 start_idx = 0
                 for c_idx, seq in enumerate(sequences):
                     n = len(seq)
-                    ff = NRCForcefield(seq)
+                    # Filter and adjust contacts local to this subunit
+                    chain_contacts = None
+                    if contacts is not None:
+                        chain_contacts = []
+                        start_res = start_idx
+                        end_res = start_idx + n
+                        for c in contacts:
+                            i, j = c[0], c[1]
+                            if start_res <= i < end_res and start_res <= j < end_res:
+                                new_c = (i - start_res, j - start_res) + c[2:]
+                                chain_contacts.append(new_c)
+                    ff = NRCForcefield(seq, contacts=chain_contacts)
                     opt_coords = ff.optimize(max_iter=steps * 10)
                     lattice[start_idx : start_idx + n] = opt_coords
                     start_idx += n
+
             else:
                 start_idx = 0
                 for c_idx, seq in enumerate(sequences):
