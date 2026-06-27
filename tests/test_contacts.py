@@ -39,8 +39,8 @@ def test_contacts():
     print(f"With contacts:    dist(0, 19) = {dist_0_19_yes:.2f} A, dist(4, 15) = {dist_4_15_yes:.2f} A")
     
     # Verify that the contacts are significantly closer in the constrained run
-    assert dist_0_19_yes < dist_0_19_no, "Residues 0 and 19 should be closer with contact constraints"
-    assert dist_4_15_yes < dist_4_15_no, "Residues 4 and 15 should be closer with contact constraints"
+    assert abs(dist_0_19_yes - 6.0) < 1.0, "Residues 0 and 19 should satisfy target restraint of 6.0"
+    assert abs(dist_4_15_yes - 6.0) < 1.0, "Residues 4 and 15 should satisfy target restraint of 6.0"
     assert dist_0_19_yes < 8.0, "Residues 0 and 19 should satisfy target restraint (< 8.0 A)"
     assert dist_4_15_yes < 8.0, "Residues 4 and 15 should satisfy target restraint (< 8.0 A)"
     

@@ -27,6 +27,18 @@ class NRCForcefield:
     All-Atom and CA-Lattice Ab Initio Thermodynamic Forcefield.
     """
 
+    # EEF1 Implicit Solvation Parameters (Free energy of solvation reference in kcal/mol and volume in A^3)
+    EEF1_DG_REF = {
+        "A": -0.67, "R": -10.3, "N": -5.3, "D": -7.3, "C": -1.2, "Q": -5.3, "E": -7.3,
+        "G": 0.0, "H": -5.3, "I": 2.4, "L": 2.2, "K": -9.3, "M": -1.0, "F": 1.2,
+        "P": -0.3, "S": -4.3, "T": -3.5, "W": -2.4, "Y": -5.3, "V": 1.9
+    }
+    EEF1_VOLUME = {
+        "A": 31.5, "R": 105.1, "N": 52.3, "D": 47.9, "C": 48.3, "Q": 67.5, "E": 64.9,
+        "G": 0.0, "H": 77.0, "I": 92.5, "L": 92.5, "K": 103.5, "M": 92.6, "F": 109.8,
+        "P": 59.8, "S": 39.4, "T": 57.0, "W": 139.7, "Y": 118.4, "V": 74.0
+    }
+
     # Chou-Fasman helical (P_alpha) and sheet (P_beta) propensities
     CHOU_FASMAN = {
         "A": (1.42, 0.83), "R": (0.98, 0.93), "N": (0.67, 0.89), "D": (1.01, 0.54),
@@ -59,6 +71,8 @@ class NRCForcefield:
             "steric": 500.0,
             "ttt7": 50.0,
             "hydro": 20.0,
+            "solvation": 20.0,
+            "centroid_steric": 100.0,
             "helix": 10.0,
             "sheet": 10.0,
             "torsion": 25.0,
@@ -95,21 +109,85 @@ class NRCForcefield:
         self.MODULAR_SCALE = 3.8017
 
         # Seed coordinates on uniform spherical Fibonacci spiral
-        self.x0 = self.spherical_fibonacci_initialization(self.N_res)
+        self.x0 = self.fragment_based_initialization(self.N_res)
 
         # Relative backbone coordinates to CA
         self.r_N_rel = torch.tensor([-1.46, 0.0, 0.0], dtype=torch.float64)
         self.r_C_rel = torch.tensor([1.52, 0.0, 0.0], dtype=torch.float64)
         self.r_O_rel = torch.tensor([2.15, 1.0, 0.0], dtype=torch.float64)
 
-    def spherical_fibonacci_initialization(self, N: int) -> np.ndarray:
-        """uniform points on sphere using Fibonacci spiral."""
-        indices = np.arange(1, N + 1)
-        z = 1 - (2 * indices - 1) / N
-        theta = (2 * np.pi / (self.phi**2)) * indices
-        x = np.sqrt(1 - z**2) * np.cos(theta)
-        y = np.sqrt(1 - z**2) * np.sin(theta)
-        return (np.column_stack((x, y, z)) * self.RG_TARGET).flatten()
+        # Precompute EEF1 arrays
+        self.dg_ref = np.array([self.EEF1_DG_REF.get(aa, 0.0) for aa in sequence])
+        self.vol = np.array([self.EEF1_VOLUME.get(aa, 0.0) for aa in sequence])
+        self.has_cb = np.array([aa != 'G' for aa in sequence], dtype=bool)
+
+        # Relative CB coordinate
+        self.r_CB_rel = torch.tensor([-0.53, -1.22, -0.75], dtype=torch.float64)
+
+
+    def fragment_based_initialization(self, N: int) -> np.ndarray:
+        """
+        Assemble sequence fragments using Chou-Fasman propensities to generate
+        idealized CA local geometries (alpha helix vs beta strand).
+        """
+        coords = np.zeros((N, 3), dtype=np.float64)
+        
+        # Ideal parameters
+        bond_len = 3.8
+        
+        # Helix CA parameters (approximate)
+        alpha_angle = 90.0 * np.pi / 180.0
+        alpha_dihedral = 51.853 * np.pi / 180.0
+        
+        # Beta CA parameters (approximate)
+        beta_angle = 120.0 * np.pi / 180.0
+        beta_dihedral = 170.0 * np.pi / 180.0
+
+        coords[0] = [0.0, 0.0, 0.0]
+        if N > 1:
+            coords[1] = [bond_len, 0.0, 0.0]
+        if N > 2:
+            coords[2] = [bond_len + bond_len * np.cos(np.pi - alpha_angle), 
+                         bond_len * np.sin(np.pi - alpha_angle), 
+                         0.0]
+                         
+        for i in range(3, N):
+            p_a = self.p_alpha[i]
+            p_b = self.p_beta[i]
+            
+            if p_a > p_b and p_a > 1.0:
+                ang = alpha_angle
+                dih = alpha_dihedral
+            else:
+                ang = beta_angle
+                dih = beta_dihedral
+                
+            v1 = coords[i-1] - coords[i-2]
+            v2 = coords[i-2] - coords[i-3]
+            
+            v1_norm = v1 / (np.linalg.norm(v1) + 1e-9)
+            v2_norm = v2 / (np.linalg.norm(v2) + 1e-9)
+            
+            n = np.cross(v2_norm, v1_norm)
+            n_norm = np.linalg.norm(n)
+            
+            if n_norm < 1e-3:
+                n = np.array([0.0, 0.0, 1.0])
+            else:
+                n = n / n_norm
+                
+            b = np.cross(v1_norm, n)
+            
+            # Rotate by ang and dih
+            vec = bond_len * (np.cos(np.pi - ang) * v1_norm + 
+                              np.sin(np.pi - ang) * np.cos(dih) * b + 
+                              np.sin(np.pi - ang) * np.sin(dih) * n)
+                              
+            coords[i] = coords[i-1] + vec
+
+        # Center on origin
+        coords -= np.mean(coords, axis=0)
+        return coords.flatten()
 
     def energy_and_gradient(self, coords_flat: np.ndarray) -> tuple:
         """
@@ -306,6 +384,47 @@ class NRCForcefield:
             # Harmonic restraint pull
             contact_e = torch.sum(contact_weights * (d_c - contact_targets)**2)
             total_e = total_e + self.weights["contact"] * contact_e
+
+        
+        # 10. Explicit Side-Chain Centroids (CB) & Implicit Solvation (EEF1)
+        if N > 2:
+            # We already have rot matrix from H-bonding (section 7a).
+            r_CB = coords + torch.matmul(rot, self.r_CB_rel)
+            
+            # Non-bonded pairs for CB-CB interactions (|i-j| >= 2 to allow adjacent sidechains to pack/repel)
+            mask_cb = np.triu(np.ones((N, N), dtype=bool), k=2)
+            if np.any(mask_cb):
+                idx_i_cb, idx_j_cb = np.where(mask_cb)
+                
+                # Filter out Glycines
+                valid_cb_pairs = torch.tensor(self.has_cb[idx_i_cb] & self.has_cb[idx_j_cb], dtype=torch.bool)
+                if torch.any(valid_cb_pairs):
+                    idx_i_cb_f = idx_i_cb[valid_cb_pairs]
+                    idx_j_cb_f = idx_j_cb[valid_cb_pairs]
+                    
+                    diff_cb = r_CB[idx_i_cb_f] - r_CB[idx_j_cb_f]
+                    d_cb = torch.norm(diff_cb, dim=1) + 1e-9
+                    
+                    # Centroid steric repulsion
+                    clash_cb = d_cb < 3.5
+                    if torch.any(clash_cb):
+                        cb_steric_e = self.weights["centroid_steric"] * torch.sum((3.5 - d_cb[clash_cb])**2)
+                        total_e = total_e + cb_steric_e
+                        
+                    # EEF1 Implicit Solvation (Gaussian desolvation)
+                    vol_i = torch.tensor(self.vol[idx_i_cb_f], dtype=torch.float64)
+                    vol_j = torch.tensor(self.vol[idx_j_cb_f], dtype=torch.float64)
+                    dg_ref_i = torch.tensor(self.dg_ref[idx_i_cb_f], dtype=torch.float64)
+                    dg_ref_j = torch.tensor(self.dg_ref[idx_j_cb_f], dtype=torch.float64)
+                    
+                    # Correlation length approx 3.5 A
+                    desolv_ij = vol_j * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
+                    desolv_ji = vol_i * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
+                    
+                    # Desolvation penalizes burial of polar groups (dg_ref < 0) 
+                    # and rewards burial of non-polar groups (dg_ref > 0)
+                    solv_e = self.weights["solvation"] * torch.sum(dg_ref_i * desolv_ij + dg_ref_j * desolv_ji)
+                    total_e = total_e + solv_e
 
         return total_e
 
