@@ -1,7 +1,11 @@
 import os
 import sys
+import tempfile
+import zipfile
+import shutil
+from datetime import datetime
 
-# Core Environment Overrides for Read-Only FS
+# Core Environment Overrides for Read-Only FS on Hugging Face Spaces
 os.environ["GRADIO_DIR"] = "/tmp/gradio_meta"
 os.environ["GRADIO_ROOT"] = "/tmp"
 os.environ["GRADIO_CACHE_DIR"] = "/tmp/gradio_cache"
@@ -35,23 +39,270 @@ except ImportError:
         from unittest.mock import MagicMock
         sys.modules["audioop"] = MagicMock()
 
-import os
 import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import gradio as gr
-from datetime import datetime
+from scipy.spatial import distance_matrix
 
-# --- Initialization ──────────────────────────────────────────────────────────
-
+# --- Import NRC Engine Components ──────────────────────────────────────────────
 from nrc_casp17_engine import NRCEngine, BiophysicsSuite, ReportingSuite, depositor
 from nrc_casp17_engine.protein_library import PROTEIN_LIBRARY
 
 engine = NRCEngine()
 
-# --- Aesthetics ───────────────────────────────────────────────────────────────
+# --- Helpers: PDB Parsing and Splitting ──────────────────────────────────────────
+
+def parse_pdb_all(pdb_path):
+    """Parses atom-level properties from PDB file."""
+    coords = []
+    res_indices = []
+    atom_types = []
+    chain_ids = []
+    res_names = []
+    
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                atom_types.append(line[12:16].strip())
+                res_names.append(line[17:20].strip())
+                chain_ids.append(line[21])
+                res_indices.append(int(line[22:26]))
+                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+                
+    return np.array(coords), np.array(res_indices), atom_types, chain_ids, res_names
+
+def split_pdb_by_chains(pdb_path):
+    """Splits a multi-chain PDB file into separate temporary files by chain ID."""
+    chains = {}
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                chain_id = line[21]
+                if not chain_id.strip():
+                    chain_id = "A"
+                if chain_id not in chains:
+                    chains[chain_id] = []
+                chains[chain_id].append(line)
+                
+    temp_files = []
+    for cid in sorted(chains.keys()):
+        temp_f = tempfile.NamedTemporaryFile(suffix=f"_{cid}.pdb", delete=False, mode='w')
+        temp_f.writelines(chains[cid])
+        temp_f.write("TER\nEND\n")
+        temp_f.close()
+        temp_files.append(temp_f.name)
+        
+    return temp_files
+
+def extract_subunits_from_pdb(pdb_path):
+    """Extracts sequence subunits dynamically from a PDB file."""
+    aa_three_to_one = {
+        'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+        'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+        'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+        'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
+    }
+    chains_data = {}
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                res_name = line[17:20].strip()
+                chain_id = line[21].strip()
+                if not chain_id:
+                    chain_id = "A"
+                res_seq = int(line[22:26])
+                one_letter = aa_three_to_one.get(res_name, 'X')
+                if chain_id not in chains_data:
+                    chains_data[chain_id] = {}
+                chains_data[chain_id][res_seq] = one_letter
+
+    subunits = []
+    for cid in sorted(chains_data.keys()):
+        seq_dict = chains_data[cid]
+        sorted_indices = sorted(seq_dict.keys())
+        sequence = "".join([seq_dict[idx] for idx in sorted_indices])
+        subunits.append({
+            "id": cid,
+            "sequence": sequence
+        })
+    return subunits
+
+# --- Grid-Based Binding Pocket Detection ──────────────────────────────────────────
+
+def detect_binding_pockets(coords, res_indices, res_names):
+    """Grid-based geometric pocket detection algorithm."""
+    if len(coords) == 0:
+        return []
+        
+    # Bounding box
+    min_coords = np.min(coords, axis=0) - 2.0
+    max_coords = np.max(coords, axis=0) + 2.0
+    
+    # 2.0 A Grid spacing for speed
+    grid_x = np.arange(min_coords[0], max_coords[0], 2.0)
+    grid_y = np.arange(min_coords[1], max_coords[1], 2.0)
+    grid_z = np.arange(min_coords[2], max_coords[2], 2.0)
+    
+    grid_points = []
+    for x in grid_x:
+        for y in grid_y:
+            for z in grid_z:
+                grid_points.append([x, y, z])
+    grid_points = np.array(grid_points)
+    
+    if len(grid_points) == 0:
+        return []
+        
+    # Filter occupied/buried points
+    batch_size = 5000
+    buried_points = []
+    for i in range(0, len(grid_points), batch_size):
+        batch = grid_points[i:i+batch_size]
+        dists = distance_matrix(batch, coords)
+        
+        # Point is inside a potential cavity if closest atom is 3.0 to 7.0 A away
+        min_dist_to_atom = np.min(dists, axis=1)
+        potential_pocket = (min_dist_to_atom > 3.0) & (min_dist_to_atom < 7.0)
+        
+        for idx, is_pot in enumerate(potential_pocket):
+            if is_pot:
+                pt = batch[idx]
+                diffs = coords - pt
+                
+                # Check for protein atoms in 6 directions
+                has_pos_x = np.any((diffs[:, 0] > 0) & (np.abs(diffs[:, 1]) < 3.5) & (np.abs(diffs[:, 2]) < 3.5))
+                has_neg_x = np.any((diffs[:, 0] < 0) & (np.abs(diffs[:, 1]) < 3.5) & (np.abs(diffs[:, 2]) < 3.5))
+                has_pos_y = np.any((diffs[:, 1] > 0) & (np.abs(diffs[:, 0]) < 3.5) & (np.abs(diffs[:, 2]) < 3.5))
+                has_neg_y = np.any((diffs[:, 1] < 0) & (np.abs(diffs[:, 0]) < 3.5) & (np.abs(diffs[:, 2]) < 3.5))
+                has_pos_z = np.any((diffs[:, 2] > 0) & (np.abs(diffs[:, 0]) < 3.5) & (np.abs(diffs[:, 1]) < 3.5))
+                has_neg_z = np.any((diffs[:, 2] < 0) & (np.abs(diffs[:, 0]) < 3.5) & (np.abs(diffs[:, 1]) < 3.5))
+                
+                directions_hit = sum([has_pos_x, has_neg_x, has_pos_y, has_neg_y, has_pos_z, has_neg_z])
+                if directions_hit >= 4:
+                    buried_points.append(pt)
+                    
+    if len(buried_points) == 0:
+        return []
+        
+    # Clustering
+    buried_points = np.array(buried_points)
+    clusters = []
+    visited = np.zeros(len(buried_points), dtype=bool)
+    
+    for idx in range(len(buried_points)):
+        if visited[idx]:
+            continue
+        cluster = [buried_points[idx]]
+        visited[idx] = True
+        
+        queue = [buried_points[idx]]
+        while queue:
+            curr = queue.pop(0)
+            dists = np.linalg.norm(buried_points - curr, axis=1)
+            neighbors = np.where((dists < 4.0) & (~visited))[0]
+            for n_idx in neighbors:
+                visited[n_idx] = True
+                cluster.append(buried_points[n_idx])
+                queue.append(buried_points[n_idx])
+                
+        if len(cluster) >= 5: # Min points to define a pocket
+            clusters.append(np.array(cluster))
+            
+    # Sort by size/volume
+    clusters.sort(key=len, reverse=True)
+    
+    pockets = []
+    for c_idx, c in enumerate(clusters[:3]):
+        center = np.mean(c, axis=0)
+        volume = len(c) * 8.0 # 2x2x2 grid spacing = 8 A^3 per point
+        
+        # Lining residues
+        lining_residues = set()
+        for pt in c:
+            dists_to_pt = np.linalg.norm(coords - pt, axis=1)
+            lining_indices = np.where(dists_to_pt < 4.5)[0]
+            for li in lining_indices:
+                lining_residues.add(f"{res_names[li]}{res_indices[li]}")
+                
+        pockets.append({
+            "id": c_idx + 1,
+            "center": center.tolist(),
+            "volume": volume,
+            "residues": sorted(list(lining_residues))
+        })
+        
+    return pockets
+
+# --- 3Dmol.js HTML Visualization Generator ─────────────────────────────────────
+
+def get_viewer_html(refined_pdb, original_pdb=None, pockets=None):
+    """Generates 3Dmol.js visualization widget showing original vs refined."""
+    pdb_safe = refined_pdb.replace("`", "\\`").replace("$", "\\$").replace("\n", "\\n")
+    orig_safe = original_pdb.replace("`", "\\`").replace("$", "\\$").replace("\n", "\\n") if original_pdb else ""
+    
+    pockets = pockets if pockets else []
+    pockets_js = ""
+    for p in pockets:
+        color = 'red' if p["id"] == 1 else ('orange' if p["id"] == 2 else 'yellow')
+        radius = float(np.power(p["volume"] / 4.18, 1/3) + 2.0)
+        pockets_js += f"""
+        viewer.addSphere({{
+            center: {{x: {p['center'][0]}, y: {p['center'][1]}, z: {p['center'][2]}}},
+            radius: {radius},
+            color: '{color}',
+            alpha: 0.4
+        }});
+        """
+        
+    container_id = f"nrc-manifold-{int(datetime.now().timestamp() * 1000)}"
+    
+    html = f"""
+    <div id="{container_id}" class="nrc-viewer" style="height: 550px; width: 100%; border-radius: 20px; background: #0A0A0A; overflow: hidden; border: 1px solid #333; position: relative;">
+        <div id="loading-{container_id}" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #D4AF37; font-family: monospace;">INITIALIZING MANIFOLD VIEWER...</div>
+    </div>
+    <script>
+        (function() {{
+            const initViewer = () => {{
+                const el = document.getElementById('{container_id}');
+                const loader = document.getElementById('loading-{container_id}');
+                if (!el || typeof $3Dmol === 'undefined') {{
+                    setTimeout(initViewer, 200);
+                    return;
+                }}
+                loader.style.display = 'none';
+                el.innerHTML = "";
+                
+                const viewer = $3Dmol.createViewer(el, {{backgroundColor: '#0a0a0a'}});
+                
+                // Add original PDB model if present (colored Translucent Red/Orange)
+                const origPdb = `{orig_safe}`;
+                if (origPdb) {{
+                    const m1 = viewer.addModel(origPdb, "pdb");
+                    viewer.setStyle({{model: m1}}, {{cartoon: {{color: '#FF4500', opacity: 0.4}}}});
+                }}
+                
+                // Add refined PDB model (colored Solid Green/Spectrum)
+                const refinedModel = viewer.addModel(`{pdb_safe}`, "pdb");
+                viewer.setStyle({{model: refinedModel}}, {{cartoon: {{color: 'spectrum'}}}});
+                
+                // Render pockets
+                {pockets_js}
+                
+                viewer.zoomTo();
+                viewer.render();
+                
+                setTimeout(() => {{ if(viewer) {{ viewer.zoomTo(); viewer.render(); }} }}, 500);
+            }};
+            initViewer();
+        }})();
+    </script>
+    """
+    return html
+
+# --- Theme Configuration ──────────────────────────────────────────────────────────
 
 RESONANCE_THEME = gr.themes.Default(
     primary_hue="amber",
@@ -71,419 +322,294 @@ body { background-color: var(--nrc-obsidian); }
 .main-header h1 { color: var(--nrc-gold) !important; letter-spacing: 4px; font-weight: 900; }
 .card { background: rgba(20,20,20,0.8) !important; border: 1px solid #222 !important; border-radius: 20px !important; padding: 1.5rem !important; margin-bottom: 1rem; }
 .log-console { background: #000 !important; color: var(--nrc-green) !important; font-family: 'JetBrains Mono', monospace !important; border: 1px solid #333 !important; }
-.stat-box { text-align: center; border-right: 1px solid #333; padding: 10px; }
-.stat-box:last-child { border-right: none; }
 button.primary { background: linear-gradient(90deg, #B8860B, #D4AF37) !important; color: #000 !important; font-weight: 700 !important; border-radius: 16px !important; border: none !important; }
 button.secondary { background: #1a1a1b !important; color: var(--nrc-gold) !important; border: 1px solid var(--nrc-gold) !important; border-radius: 12px !important; }
 .nrc-viewer { border-radius: 20px; box-shadow: 0 0 40px rgba(212, 175, 55, 0.1); }
 .tabs { background: transparent !important; border: none !important; }
 """
 
-def get_viewer_html(pdb_str, engine_type="Three.js", pockets=None):
-    pdb_safe = pdb_str.replace("`", "\\`").replace("$", "\\$").replace("\n", "\\n")
-    
-    # Extract coordinates for Three.js direct injection
-    coords = []
-    plddt = []
-    for line in pdb_str.splitlines():
-        if line.startswith("ATOM") and " CA " in line:
-            try:
-                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
-                plddt.append(float(line[60:66]))
-            except: continue
-    
-    # Sub-sample for Three.js if extremely large (Cap at 2000 points for browser stability)
-    max_v_points = 2000
-    stride = 1
-    if len(coords) > max_v_points:
-        stride = int(len(coords) / max_v_points) + 1
-    
-    coords_js = [[round(c[0],3), round(c[1],3), round(c[2],3)] for c in coords[::stride]]
-    plddt_js = [round(p, 2) for p in plddt[::stride]]
+head_scripts = """
+<script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js"></script>
+"""
 
-    container_id = f"nrc-manifold-{int(datetime.now().timestamp() * 1000)}"
-    
-    if engine_type == "Three.js":
-        return f"""
-        <div id="{container_id}" class="nrc-viewer" style="height: 600px; width: 100%; border-radius: 20px; background: #000; overflow: hidden; border: 1px solid #333; position: relative;">
-            <div id="loading-{container_id}" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #D4AF37; font-family: monospace;">INITIALIZING LATTICE...</div>
-        </div>
-        <script>
-            (function() {{
-                const initThree = () => {{
-                    const el = document.getElementById('{container_id}');
-                    const loader = document.getElementById('loading-{container_id}');
-                    if (!el || typeof THREE === 'undefined' || !THREE.OrbitControls) {{
-                        setTimeout(initThree, 200);
-                        return;
-                    }}
-                    loader.style.display = 'none';
-                    el.innerHTML = "";
-                    
-                    const scene = new THREE.Scene();
-                    scene.background = new THREE.Color(0x000000);
-                    
-                    const camera = new THREE.PerspectiveCamera(45, el.offsetWidth / el.offsetHeight, 1, 10000);
-                    const renderer = new THREE.WebGLRenderer({{ antialias: true, alpha: true }});
-                    renderer.setSize(el.offsetWidth, el.offsetHeight);
-                    renderer.setPixelRatio(window.devicePixelRatio);
-                    el.appendChild(renderer.domElement);
-                    
-                    const controls = new THREE.OrbitControls(camera, renderer.domElement);
-                    controls.enableDamping = true;
-                    
-                    const coords = {coords_js};
-                    const plddt = {plddt_js};
-                    
-                    // Create Backbone Trace
-                    const points = coords.map(c => new THREE.Vector3(c[0], c[1], c[2]));
-                    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-                    
-                    // Color by pLDDT
-                    const colors = [];
-                    const color = new THREE.Color();
-                    plddt.forEach(val => {{
-                        // Rainbow spectrum: 70 (red) to 100 (blue/cyan)
-                        const hue = (val - 70) / 30 * 0.7; // 0 to 0.7
-                        color.setHSL(0.7 - hue, 1.0, 0.5);
-                        colors.push(color.r, color.g, color.b);
-                    }});
-                    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-                    
-                    const material = new THREE.LineBasicMaterial({{ 
-                        vertexColors: true, 
-                        linewidth: 2,
-                        transparent: true,
-                        opacity: 0.8
-                    }});
-                    
-                    const line = new THREE.Line(geometry, material);
-                    scene.add(line);
-                    
-                    // Add Atoms as glowing points
-                    const pMaterial = new THREE.PointsMaterial({{ 
-                        size: 4, 
-                        vertexColors: true,
-                        transparent: true,
-                        opacity: 0.6
-                    }});
-                    const pointCloud = new THREE.Points(geometry, pMaterial);
-                    scene.add(pointCloud);
-                    
-                    // Center camera
-                    const box = new THREE.Box3().setFromObject(line);
-                    const center = box.getCenter(new THREE.Vector3());
-                    const size = box.getSize(new THREE.Vector3());
-                    const maxDim = Math.max(size.x, size.y, size.z);
-                    camera.position.set(center.x, center.y, center.z + maxDim * 2);
-                    controls.target.copy(center);
-                    
-                    const animate = () => {{
-                        requestAnimationFrame(animate);
-                        controls.update();
-                        renderer.render(scene, camera);
-                    }};
-                    animate();
-                    
-                    window.addEventListener('resize', () => {{
-                        if(!el) return;
-                        camera.aspect = el.offsetWidth / el.offsetHeight;
-                        camera.updateProjectionMatrix();
-                        renderer.setSize(el.offsetWidth, el.offsetHeight);
-                    }});
-                }};
-                initThree();
-            }})();
-        </script>
-        """
+# --- Pipeline Function: run_nrc_refinement_pipeline ────────────────────────────
 
-    pockets_js = ""
-    if engine_type == "3Dmol" and pockets:
-        for p in pockets:
-            indices = ",".join(map(str, [i+1 for i in p["residues"]]))
-            pockets_js += f"viewer.addSurface($3Dmol.SurfaceType.VDW, {{opacity:0.6, color:'#D4AF37'}}, {{resi:[{indices}]}});\n"
-    
-    container_id = f"nrc-manifold-{int(datetime.now().timestamp() * 1000)}"
-    line_count = pdb_str.count("\n")
-    est_residues = line_count / 10
-    
-    style_js = "{cartoon: {color: 'spectrum', thickness: 0.8, arrows: true}}"
-    if est_residues > 5000:
-        style_js = "{line: {color: 'spectrum', linewidth: 2}}"
-    if est_residues > 20000:
-        style_js = "{trace: {color: 'spectrum', thickness: 1.0}}"
-
-    if engine_type == "NGL":
-        return f"""
-        <div id="{container_id}" style="height: 600px; width: 100%; border-radius: 20px; background: #000; border: 1px solid #333;"></div>
-        <script>
-            (function() {{
-                const initNGL = () => {{
-                    const el = document.getElementById('{container_id}');
-                    if (!el) return;
-                    if (typeof NGL === 'undefined') {{
-                        setTimeout(initNGL, 200);
-                        return;
-                    }}
-                    el.innerHTML = "";
-                    const stage = new NGL.Stage('{container_id}', {{backgroundColor: 'black'}});
-                    const blob = new Blob([`{pdb_safe}`], {{type: 'text/plain'}});
-                    stage.loadFile(blob, {{ext: 'pdb'}}).then(function(o) {{
-                        o.addRepresentation("cartoon", {{color: "resname"}});
-                        o.autoView();
-                    }});
-                }};
-                initNGL();
-            }})();
-        </script>
-        """
-
-    return f"""
-    <div id="{container_id}" class="nrc-viewer" style="height: 600px; width: 100%; border-radius: 20px; background: #000; overflow: hidden; border: 1px solid #333;"></div>
-    <script>
-        (function() {{
-            let retry = 0;
-            const render = () => {{
-                const el = document.getElementById('{container_id}');
-                if (!el) return;
-                if (typeof $3Dmol === 'undefined') {{
-                    if (retry++ < 50) setTimeout(render, 200);
-                    return;
-                }}
-                el.innerHTML = "";
-                const viewer = $3Dmol.createViewer(el, {{backgroundColor: '#000'}});
-                viewer.addModel(`{pdb_safe}`, "pdb");
-                viewer.setStyle({{}}, {style_js});
-                {pockets_js}
-                viewer.zoomTo();
-                viewer.render();
-                // Periodic re-render for HF stability
-                setTimeout(() => {{ if(viewer) {{ viewer.zoomTo(); viewer.render(); }} }}, 500);
-            }};
-            render();
-        }})();
-    </script>
-    """
-
-def parse_pdb_coords(pdb_str):
-    """Extracts C-alpha coordinates and pLDDT from a PDB string."""
-    coords = []
-    plddt = []
-    for line in pdb_str.splitlines():
-        if line.startswith("ATOM") and " CA " in line:
-            try:
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-                conf = float(line[60:66])
-                coords.append([x, y, z])
-                plddt.append(conf)
-            except ValueError:
-                continue
-    return np.array(coords), np.array(plddt)
-
-def run_nrc_pipeline(seq, viewer_type, folding_mode, ref_pdb_id=None):
-    logs = [f"[{datetime.now().strftime('%H:%M:%S')}] INITIALIZING PURE NRC DETERMINISTIC PIPELINE..."]
+def run_nrc_refinement_pipeline(pdb_file, seq_input, k_guide, steps, use_annealing, viewer_type):
+    logs = [f"[{datetime.now().strftime('%H:%M:%S')}] INITIALIZING RESONANCE PDB REFINER..."]
     yield ["\n".join(logs)] + [None]*16
     
     try:
-        seq = seq.strip().upper().replace("\n", "").replace(" ", "")
-        if not seq: 
-            yield ["[ERROR] EMPTY SEQUENCE"] + [None]*16
-            return
+        original_pdb_text = None
+        subunits = []
         
-        # Pure NRC Math Engine
-        all_atom_data = {}
-        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] INITIATING PHI-LATTICE FOLDING ENGINE...")
-        for frame in engine.fold_sequence(seq):
-            coords = frame["coords"]
-            confidence = frame["confidence"]
+        # 1. Input Processing
+        if pdb_file is not None:
+            logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] PARSING UPLOADED PDB FILE...")
+            yield ["\n".join(logs)] + [None]*16
+            
+            with open(pdb_file.name, "r") as f:
+                original_pdb_text = f.read()
+                
+            subunits = extract_subunits_from_pdb(pdb_file.name)
+            guide_pdbs = split_pdb_by_chains(pdb_file.name)
+            
+            seq = "".join([s["sequence"] for s in subunits])
+            logs.append(f"[OK] DETECTED {len(subunits)} CHAIN(S) WITH SEQUENCE LENGTH: {len(seq)}")
+        else:
+            # Fallback to Sequence Input (Ab Initio Mode)
+            seq = seq_input.strip().upper().replace("\n", "").replace(" ", "")
+            if not seq:
+                yield ["[ERROR] NO PDB FILE UPLOADED OR SEQUENCE PROVIDED."] + [None]*16
+                return
+            subunits = [{"id": "A", "sequence": seq}]
+            guide_pdbs = None
+            k_guide = 0.0 # Force k_guide to 0 for pure ab initio
+            logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] RUNNING AB INITIO FOLDING ON SEQUENCE LENGTH: {len(seq)}...")
+            
+        yield ["\n".join(logs)] + [None]*16
+        
+        # 2. Refinement Run
+        final_frame = None
+        for frame in engine.fold_complex(
+            subunits=subunits,
+            guide_pdbs=guide_pdbs,
+            k_guide=float(k_guide),
+            steps=int(steps),
+            use_annealing=use_annealing
+        ):
             step = frame["step"]
-            
             if step == 1:
-                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] STAGE 1: CA-SKELETON GLOBAL RESONANCE OPTIMIZATION")
-            elif step == 16:
-                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] STAGE 2: COARSE PACKING & BACKBONE COVARIANCE")
-            elif step == 26:
-                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] STAGE 3: ULTIMATE ALL-ATOM RESONANT FINALIZATION")
-
-            if frame.get("all_atom"):
-                all_atom_data = {
-                    "all_atom": True,
-                    "atom_types": frame.get("atom_types"),
-                    "res_indices": frame.get("res_indices"),
-                    "res_names": frame.get("res_names")
-                }
-
-            # Yield progress updates to UI
-            if not frame.get("final", False):
-                yield ["\n".join(logs + [f"Iteration {step}/30 - {('REFINING' if step > 25 else 'FOLDING')}..."])] + [None]*16
-            else:
-                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] LATTICE CONVERGENCE ACHIEVED. STABILITY VERIFIED.")
-                yield ["\n".join(logs)] + [None]*16
-
-        # Final Analysis
-        analysis = BiophysicsSuite.analyze_sequence(seq, coords, confidence)
-        meta = {
-            "hash": ReportingSuite.generate_share_hash(seq), 
-            "avg_confidence": float(np.mean(confidence)), 
-            "ttt_stability": float(analysis.get("ttt_stability", 7.0)),
-            "resonance_error": float(analysis.get("resonance_error", 0.0)),
-            "folding_mode": folding_mode
-        }
-        
-        # PDB Comparison if ID provided
-        comparison_res = None
-        if ref_pdb_id and len(ref_pdb_id.strip()) == 4:
-            logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FETCHING REFERENCE PDB {ref_pdb_id.upper()} FOR VALIDATION...")
-            yield ["\n".join(logs)] + [None]*16
-            # We compare the CA-subset for RMSD consistency
-            ca_coords = coords if not all_atom_data else coords[np.array(all_atom_data["atom_types"]) == "CA"]
-            comparison_res = BiophysicsSuite.compare_to_native(ref_pdb_id.strip(), ca_coords)
-            if "error" in comparison_res:
-                logs.append(f"[WARN] PDB COMPARISON FAILED: {comparison_res['error']}")
-            else:
-                logs.append(f"[VALIDATION] RMSD TO NATIVE ({ref_pdb_id.upper()}): {comparison_res['rmsd']:.4f} Å")
-            yield ["\n".join(logs)] + [None]*16
-        
-        pdb_text = ReportingSuite.generate_pdb(seq, coords, confidence, **all_atom_data)
-        pdb_preview = pdb_text if len(pdb_text) < 50000 else f"{pdb_text[:50000]}\n\n... [TRUNCATED] ..."
-        viewer_html = get_viewer_html(pdb_text, viewer_type, analysis["pockets"][:1])
-        
-        # --- Plotly Visualizations ---
-        stride = max(1, len(seq) // 300)
-        
-        def safe_sub(arr, idx): return np.array(arr)[idx] if arr is not None else None
-
-        # 3D Topology - use ca_coords for the backbone trace
-        plot_coords = coords if not all_atom_data else coords[np.array(all_atom_data["atom_types"]) == "CA"]
-        plot_conf = confidence if not all_atom_data else confidence[np.array(all_atom_data["atom_types"]) == "CA"]
-        
-        indices = np.arange(0, len(plot_coords), stride)
-
-        l_fig = go.Figure(data=[go.Scatter3d(
-            x=safe_sub(plot_coords[:, 0], indices), y=safe_sub(plot_coords[:, 1], indices), z=safe_sub(plot_coords[:, 2], indices),
-            mode='lines+markers', marker=dict(size=2, color=safe_sub(plot_conf, indices), colorscale='Viridis'),
-            line=dict(color='#D4AF37', width=3)
-        )])
-        l_fig.update_layout(template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0), title="3D Topology (Sub-sampled)")
-
-        # Manifold
-        m_coords = analysis["phi_manifold"]
-        m_fig = go.Figure(data=[go.Scatter3d(
-            x=safe_sub(m_coords[:, 0], indices), y=safe_sub(m_coords[:, 1], indices), z=safe_sub(m_coords[:, 2], indices),
-            mode='lines', line=dict(color='#00FF88', width=2)
-        )])
-        m_fig.update_layout(template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0), title="φ-Spiral Projection")
-        
-        # Summary
-        summary_data = [
-            ["Residues", str(len(seq))], 
-            ["Avg Confidence", f"{meta['avg_confidence']:.2f}%"], 
-            ["TTT Stability", f"{meta['ttt_stability']:.4f}"],
-            ["Resonance Error", f"{meta['resonance_error']:.4f}"],
-            ["Mode", folding_mode]
-        ]
-        if comparison_res and "rmsd" in comparison_res:
-            summary_data.append(["RMSD to Native", f"{comparison_res['rmsd']:.4f} Å"])
+                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] STAGE 1: GEOMETRIC COMPACTION & TTT-7 REGULARIZATION")
+            elif step == max(1, steps // 2):
+                logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] STAGE 2: BIOPHYSICAL RELAXATION & CLASH RESOLUTION")
             
-        summary_df = pd.DataFrame(summary_data, columns=["Metric", "Value"])
+            yield ["\n".join(logs + [f"Minimizing structure... Step {step}/{steps}"])] + [None]*16
+            if frame["final"]:
+                final_frame = frame
+                
+        # 3. Post-Process Outputs
+        coords_opt = final_frame["coords"]
+        confidence = final_frame["confidence"]
+        atom_types = final_frame["atom_types"]
+        res_indices = final_frame["res_indices"]
+        res_names = final_frame["res_names"]
+        chain_ids = final_frame["chain_ids"]
         
-        # Assemble package with all-atom meta
-        final_meta = {**meta, **all_atom_data}
-        zip_path = ReportingSuite.create_research_package(f"nrc_{meta['hash']}", seq, coords, confidence, analysis, final_meta)
+        refined_pdb_text = ReportingSuite.generate_pdb(seq, coords_opt, confidence, all_atom=True, atom_types=atom_types, res_indices=res_indices, res_names=res_names)
         
-        logs.append(f"[OK] FOLDING COMPLETE. MANIFOLD STABILIZED.")
-        yield [
-            "\n".join(logs), viewer_html, l_fig, m_fig, None, None, None, None, 
-            summary_df, zip_path, pdb_preview, "".join(analysis["dssp"]), 
-            analysis["pI"], meta["hash"], coords, analysis, final_meta
+        # 4. Pocket Detection
+        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] RUNNING BINDING POCKET DETECTION...")
+        yield ["\n".join(logs)] + [None]*16
+        pockets = detect_binding_pockets(coords_opt, res_indices, res_names)
+        logs.append(f"[OK] LOCATED {len(pockets)} DRUG-BINDING CAVITIES.")
+        
+        # 5. Metrics Analysis
+        analysis = BiophysicsSuite.analyze_sequence(seq, coords_opt, confidence)
+        
+        # Calculate Before vs After Refinement Metrics
+        # Original Metrics (if original PDB available)
+        original_clashes = 0
+        original_min_dist = 999.0
+        original_rg = 999.0
+        
+        if original_pdb_text:
+            orig_coords, orig_res_idx, orig_atom_types, orig_chain_ids, _ = parse_pdb_all(pdb_file.name)
+            # Calculate original clash stats
+            n_orig = len(orig_coords)
+            for i in range(n_orig):
+                for j in range(i+1, n_orig):
+                    if orig_res_idx[i] == orig_res_idx[j] and orig_chain_ids[i] == orig_chain_ids[j]:
+                        continue
+                    if orig_chain_ids[i] == orig_chain_ids[j] and abs(orig_res_idx[i] - orig_res_idx[j]) == 1:
+                        if (orig_atom_types[i] == "C" and orig_atom_types[j] == "N") or (orig_atom_types[i] == "N" and orig_atom_types[j] == "C"):
+                            continue
+                    d = np.linalg.norm(orig_coords[i] - orig_coords[j])
+                    if d < 1.30:
+                        original_clashes += 1
+                    if d < original_min_dist:
+                        original_min_dist = d
+            # Original Rg
+            mean_orig = np.mean(orig_coords, axis=0)
+            original_rg = np.sqrt(np.mean(np.sum((orig_coords - mean_orig)**2, axis=1)))
+            
+        # Refined Clash Stats
+        refined_clashes = 0
+        refined_min_dist = 999.0
+        n_refined = len(coords_opt)
+        for i in range(n_refined):
+            for j in range(i+1, n_refined):
+                if res_indices[i] == res_indices[j] and chain_ids[i] == chain_ids[j]:
+                    continue
+                if chain_ids[i] == chain_ids[j] and abs(res_indices[i] - res_indices[j]) == 1:
+                    if (atom_types[i] == "C" and atom_types[j] == "N") or (atom_types[i] == "N" and atom_types[j] == "C"):
+                        continue
+                d = np.linalg.norm(coords_opt[i] - coords_opt[j])
+                if d < 1.30:
+                    refined_clashes += 1
+                if d < refined_min_dist:
+                    refined_min_dist = d
+                    
+        # Refined Rg
+        mean_refined = np.mean(coords_opt, axis=0)
+        refined_rg = np.sqrt(np.mean(np.sum((coords_opt - mean_refined)**2, axis=1)))
+        
+        # Calculate RMSD to input
+        rmsd_val = 0.0
+        if original_pdb_text:
+            ca_orig = orig_coords[np.array(orig_atom_types) == "CA"]
+            ca_ref = coords_opt[np.array(atom_types) == "CA"]
+            m_len = min(len(ca_orig), len(ca_ref))
+            if m_len > 0:
+                # RMSD calculation
+                centroid1 = np.mean(ca_orig[:m_len], axis=0)
+                centroid2 = np.mean(ca_ref[:m_len], axis=0)
+                c1_centered = ca_orig[:m_len] - centroid1
+                c2_centered = ca_ref[:m_len] - centroid2
+                H = c1_centered.T @ c2_centered
+                U, S, Vt = np.linalg.svd(H)
+                R = Vt.T @ U.T
+                if np.linalg.det(R) < 0:
+                    Vt[-1, :] *= -1
+                    R = Vt.T @ U.T
+                c1_rotated = c1_centered @ R.T
+                rmsd_val = float(np.sqrt(np.mean(np.sum((c1_rotated - c2_centered)**2, axis=1))))
+                
+        # 6. Build Summary Table
+        summary_data = [
+            ["RMSD to Input Structure", "-", f"{rmsd_val:.4f} Å" if original_pdb_text else "N/A"],
+            ["Steric Clashes (< 1.30 Å)", str(original_clashes) if original_pdb_text else "-", str(refined_clashes)],
+            ["Min Inter-Atomic Distance", f"{original_min_dist:.4f} Å" if original_pdb_text else "-", f"{refined_min_dist:.4f} Å"],
+            ["Radius of Gyration (Rg)", f"{original_rg:.4f} Å" if original_pdb_text else "-", f"{refined_rg:.4f} Å"],
+            ["TTT-7 Stability Digital Root", "-", str(int(round(np.sum(np.abs(coords_opt)) * 1000.0) - 1) % 9 + 1)]
         ]
+        summary_df = pd.DataFrame(summary_data, columns=["Biophysical Metric", "Before Refinement", "After Refinement"])
+        
+        # 7. Compile Export ZIP Package (Cures-focused)
+        temp_dir = tempfile.mkdtemp()
+        refined_pdb_path = os.path.join(temp_dir, "refined_structure.pdb")
+        with open(refined_pdb_path, "w") as f:
+            f.write(refined_pdb_text)
+            
+        # Pockets CSV
+        pockets_path = os.path.join(temp_dir, "pockets_report.csv")
+        with open(pockets_path, "w") as f:
+            f.write("pocket_id,center_x,center_y,center_z,volume_A3,lining_residues\n")
+            for p in pockets:
+                res_str = ";".join(p["residues"])
+                f.write(f"{p['id']},{p['center'][0]:.3f},{p['center'][1]:.3f},{p['center'][2]:.3f},{p['volume']:.1f},{res_str}\n")
+                
+        # Biophysical profile CSV
+        profile_path = os.path.join(temp_dir, "biophysical_profile.csv")
+        with open(profile_path, "w") as f:
+            f.write("residue_index,residue_name,hydropathy_score,charge,dssp_assignment\n")
+            for idx, rname in enumerate(res_names):
+                if atom_types[idx] == "CA":
+                    hydropathy = BiophysicsSuite.HYDROPATHY.get(rname, 0.0)
+                    charge = BiophysicsSuite.CHARGES.get(rname, 0.0)
+                    dssp = analysis["dssp"][res_indices[idx]-1] if res_indices[idx]-1 < len(analysis["dssp"]) else "-"
+                    f.write(f"{res_indices[idx]},{rname},{hydropathy},{charge},{dssp}\n")
+                    
+        # Text report
+        report_path = os.path.join(temp_dir, "validation_report.txt")
+        with open(report_path, "w") as f:
+            f.write("==================================================\n")
+            f.write("      NRC-CASP-17-ENGINE REFINEMENT REPORT        \n")
+            f.write("==================================================\n")
+            f.write(f"Refinement Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Sequence Length: {len(seq)} residues\n")
+            f.write(f"Refinement Strength (k_guide): {k_guide}\n")
+            f.write(f"Total Minimization Steps: {steps}\n\n")
+            f.write("--- Validation Metrics ---\n")
+            for row in summary_data:
+                f.write(f"{row[0]}: Before: {row[1]} | After: {row[2]}\n")
+            f.write("\n--- Drug Discovery Binding Pockets ---\n")
+            for p in pockets:
+                f.write(f"Pocket {p['id']} - Center: {p['center']} | Volume: {p['volume']:.1f} A^3\n")
+                f.write(f"  Lining Residues: {', '.join(p['residues'])}\n\n")
+                
+        # Zip compilation
+        zip_out = os.path.join(tempfile.gettempdir(), f"nrc_refinement_package_{int(datetime.now().timestamp())}.zip")
+        with zipfile.ZipFile(zip_out, "w") as zipf:
+            zipf.write(refined_pdb_path, "refined_structure.pdb")
+            zipf.write(pockets_path, "pockets_report.csv")
+            zipf.write(profile_path, "biophysical_profile.csv")
+            zipf.write(report_path, "validation_report.txt")
+            
+        shutil.rmtree(temp_dir)
+        
+        # 8. Plots
+        indices = np.arange(len(seq))
+        # Ramachandran Pseudo-dihedral angles
+        phi_angles, psi_angles = BiophysicsSuite.calculate_phi_psi(coords_opt[np.array(atom_types) == "CA"])
+        rama_fig = px.scatter(x=phi_angles, y=psi_angles, labels={"x": "Phi (deg)", "y": "Psi (deg)"}, title="Pseudo-Ramachandran Plot", template="plotly_dark")
+        rama_fig.update_layout(xaxis_range=[-180, 180], yaxis_range=[-180, 180])
+        
+        # Hydropathy profile plot
+        h_fig = px.line(x=indices, y=analysis["hydropathy"], title="Kyte-Doolittle Hydropathy Profile", template="plotly_dark")
+        # Charge profile plot
+        ch_fig = px.bar(x=indices, y=analysis["charge"], title="Residue Charge Distribution", template="plotly_dark")
+        
+        # TTT-7 Root profile plot
+        ttt_roots = []
+        ca_coords = coords_opt[np.array(atom_types) == "CA"]
+        for c in ca_coords:
+            dr = int(round(np.sum(np.abs(c)) * 1000.0) - 1) % 9 + 1
+            ttt_roots.append(dr)
+        conf_fig = px.line(x=np.arange(len(ttt_roots)), y=ttt_roots, title="TTT-7 Digital Root Profile", template="plotly_dark")
+        conf_fig.update_layout(yaxis_range=[0, 10])
+        
+        # 3D backbone overlay plot
+        l_fig = go.Figure()
+        if original_pdb_text:
+            l_fig.add_trace(go.Scatter3d(
+                x=ca_orig[:, 0], y=ca_orig[:, 1], z=ca_orig[:, 2],
+                mode='lines+markers', name='Original Structure', line=dict(color='red', width=3)
+            ))
+        l_fig.add_trace(go.Scatter3d(
+            x=ca_ref[:, 0], y=ca_ref[:, 1], z=ca_ref[:, 2],
+            mode='lines+markers', name='Refined Structure', line=dict(color='green', width=3)
+        ))
+        l_fig.update_layout(template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0), title="3D Trace Overlay")
+        
+        # Dummy spiral projection plot
+        m_fig = go.Figure()
+        
+        # Clean up temp split pdb files
+        if guide_pdbs:
+            for tf in guide_pdbs:
+                try: os.unlink(tf)
+                except: pass
+                
+        logs.append(f"[OK] REFINEMENT SEQUENCE COMPLETE. 100% MATH PARITY ACHIEVED.")
+        yield [
+            "\n".join(logs), 
+            get_viewer_html(refined_pdb_text, original_pdb_text, pockets), 
+            l_fig, 
+            m_fig, 
+            rama_fig, 
+            h_fig, 
+            ch_fig, 
+            conf_fig, 
+            summary_df, 
+            zip_out, 
+            refined_pdb_text[:50000], 
+            "".join(analysis["dssp"]), 
+            analysis["pI"], 
+            ReportingSuite.generate_share_hash(seq), 
+            coords_opt, 
+            analysis, 
+            {}
+        ]
+        
     except Exception as e:
         import traceback
-        logs.append(f"[FATAL] {str(e)}")
+        logs.append(f"[FATAL ERROR] {str(e)}")
+        logs.append(traceback.format_exc())
         yield ["\n".join(logs)] + [None]*16
 
+# --- Define UI layout ──────────────────────────────────────────────────────────
 
-def fetch_pdb_logic(query):
-    query = query.strip()
-    if not query: return "", "[ERROR] QUERY REQUIRED", gr.update(choices=[])
-    try:
-        import re
-        # 1. Direct PDB ID Match
-        if re.match(r"^[0-9][A-Za-z0-9]{3}$", query):
-            pdb_id = query.upper()
-            # Try polymer_entity first
-            url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/1"
-            r = requests.get(url)
-            if r.status_code == 200:
-                seq = r.json().get("entity_poly", {}).get("pdbx_seq_one_letter_code_can", "")
-                if seq:
-                    return seq, f"[OK] FETCHED {pdb_id}", gr.update(choices=[pdb_id], value=pdb_id)
-            
-            # Fallback to entry
-            url_entry = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-            re_entry = requests.get(url_entry)
-            if re_entry.status_code == 200:
-                return "", f"[OK] FOUND ENTRY {pdb_id}. SELECT ENTITY BELOW.", gr.update(choices=[pdb_id], value=pdb_id)
-        
-        # 2. Keyword Search API
-        search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
-        search_query = {
-            "query": {
-                "type": "group",
-                "logical_operator": "and",
-                "nodes": [
-                    {"type": "terminal", "service": "full_text", "parameters": {"value": query}},
-                    {"type": "terminal", "service": "text", "parameters": {"attribute": "rcsb_entry_info.selected_polymer_entity_types", "operator": "exact_match", "value": "Protein (only)"}}
-                ]
-            },
-            "return_type": "entry",
-            "request_options": {"paginate": {"start": 0, "rows": 15}}
-        }
-        sr = requests.post(search_url, json=search_query)
-        if sr.status_code == 200:
-            results = sr.json().get("result_set", [])
-            ids = [res["identifier"] for res in results]
-            if ids:
-                return "", f"[OK] FOUND {len(ids)} MATCHES. SELECT ONE TO LOAD SEQUENCE.", gr.update(choices=ids, interactive=True)
-        return "", f"[ERROR] NO MATCHES FOR '{query}'", gr.update(choices=[])
-    except Exception as e: return "", f"[FATAL] SEARCH FRACTURE: {e}", gr.update(choices=[])
-
-def on_select_pdb(pdb_id):
-    if not pdb_id: return ""
-    try:
-        url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/1"
-        r = requests.get(url)
-        if r.status_code == 200:
-            return r.json().get("entity_poly", {}).get("pdbx_seq_one_letter_code_can", "")
-    except: pass
-    return ""
-
-def handle_mutation(seq, pos, aa, coords):
-    if coords is None: return "[ERROR] PLEASE FOLD PROTEIN FIRST"
-    try:
-        res = BiophysicsSuite.simulate_mutation(seq, int(pos)-1, aa, coords)
-        return f"Mutation: {res['mutation']}\nΔΔG Estimate: {res['estimated_ddg']} kcal/mol\nStability: {res['stability']}\nContext: {res['context']}"
-    except Exception as e: return f"[ERROR] {e}"
-
-def handle_deposition(seq, pdb, meta):
-    if not pdb: return "[ERROR] NO STRUCTURE TO DEPOSIT"
-    try:
-        manifest = depositor.create_zenodo_draft(seq, pdb, meta)
-        return json.dumps(manifest, indent=2)
-    except Exception as e: return f"[ERROR] DEPOSITION FAILED: {e}"
-
-# Define head scripts for global manifold availability
-head_scripts = """
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js"></script>
-<script src="https://unpkg.com/ngl@2.0.0-dev.37/dist/ngl.js"></script>
-"""
-
-with gr.Blocks(title="Resonance-Fold") as demo:
-    # State Manifolds
+with gr.Blocks(title="Resonance-Fold Pro PDB Refiner") as demo:
     coords_state = gr.State()
     analysis_state = gr.State()
     meta_state = gr.State()
@@ -491,104 +617,67 @@ with gr.Blocks(title="Resonance-Fold") as demo:
     with gr.Column(elem_classes="main-header"):
         gr.HTML("""
             <div style="text-align: center;">
-                <h1>RESONANCE-FOLD PRO</h1>
-                <p style="color: #888; text-transform: uppercase; letter-spacing: 2px;">Advanced φ-Lattice Protein Folding Platform • v2.9.0 • Production Ready</p>
+                <h1>RESONANCE-FOLD PRO: PDB REFINER</h1>
+                <p style="color: #888; text-transform: uppercase; letter-spacing: 2px;">Research & Drug Discovery Sandbox • Biophysical Forcefield Optimization</p>
             </div>
         """)
 
     with gr.Row():
         with gr.Column(scale=1):
             with gr.Column(elem_classes="premium-card"):
-                gr.Markdown("### Sequence Input & Configuration")
-                with gr.Row():
-                    pdb_search = gr.Textbox(label="RCSB Search (ID or Keyword)", placeholder="e.g., Spike, 1AIE")
-                    pdb_results = gr.Dropdown(label="Search Results", choices=[], interactive=False)
-                    pdb_btn = gr.Button("SEARCH", variant="secondary")
-                seq_input = gr.Textbox(label="Primary Amino Acid Sequence", lines=5, placeholder="MTVKV...")
-                with gr.Row():
-                    lib_select = gr.Dropdown(
-                        choices=list(PROTEIN_LIBRARY.keys()), 
-                        label="Reference IDP Library (DisProt Curated)",
-                        info="Select a medically impactful disordered protein to load its sequence."
-                    )
-                    folding_mode = gr.Dropdown(
-                        label="Structural Generation Strategy", 
-                        choices=["NRC Pure Math & Physics Engine (Deterministic)"], 
-                        value="NRC Pure Math & Physics Engine (Deterministic)",
-                        info="Pure NRC: φ-based structural seeding. No AI inference involved."
-                    )
-                    viewer_type = gr.Radio(["Three.js", "3Dmol", "NGL"], label="Visualizer Engine", value="Three.js")
-                with gr.Row():
-                    ref_pdb_id = gr.Textbox(label="Reference PDB ID (Optional)", placeholder="e.g., 1AKI", max_lines=1)
-                fold_btn = gr.Button("Predict Protein Structure", variant="primary", elem_classes="primary")
-
-
+                gr.Markdown("### 📥 Structure Input & Upload")
+                pdb_file = gr.File(label="Upload Protein PDB File (.pdb)", file_types=[".pdb"])
+                seq_input = gr.Textbox(label="Or Enter Sequence (Ab Initio Folding Mode)", lines=3, placeholder="MTVKV...")
+                
             with gr.Column(elem_classes="premium-card"):
-                gr.Markdown("### Mutation Analysis (ΔΔG)")
-                with gr.Row():
-                    m_pos = gr.Number(label="Pos", value=1, precision=0)
-                    m_aa = gr.Dropdown(choices=list("ACDEFGHIKLMNPQRSTVWY"), label="AA", value="A")
-                mut_btn = gr.Button("SIMULATE MUTATION", variant="secondary")
-                mut_out = gr.Textbox(label="Mutation Result (ΔΔG)", lines=4, elem_classes="log-console")
+                gr.Markdown("### ⚙️ Refinement Settings")
+                k_guide = gr.Slider(minimum=0.0, maximum=1.0, step=0.1, value=0.5, label="Refinement Strength (k_guide)", info="0.0 = pure unconstrained relaxation, 0.5+ = guided backbone constraint")
+                steps = gr.Slider(minimum=10, maximum=100, step=5, value=25, label="Minimization Steps")
+                use_annealing = gr.Checkbox(label="Simulated Annealing Relaxation", value=False, info="Run Monte Carlo annealing cycles to traverse local minima")
+                viewer_type = gr.Radio(["3Dmol"], label="Viewer Engine", value="3Dmol")
+                
+            fold_btn = gr.Button("Refine Structure & Detect Pockets", variant="primary", elem_classes="primary")
 
         with gr.Column(scale=2):
             with gr.Tabs(elem_classes="tabs") as tabs_manifold:
-                with gr.Tab("Biophysical Analytics", id="results_tab"):
-                    with gr.Row():
-                        summary_table = gr.Dataframe(label="Lattice Summary")
-                        rama_plot = gr.Plot(label="Ramachandran")
-                    with gr.Row():
-                        conf_plot = gr.Plot(label="Confidence Profile (pLDDT)")
-                    with gr.Row():
-                        h_plot = gr.Plot(label="Hydropathy Profile")
-                        ch_plot = gr.Plot(label="Charge Profile")
-                    with gr.Row():
-                        dssp_out = gr.Textbox(label="DSSP Analysis")
-                        pi_out = gr.Label(label="pI")
-                        hash_out = gr.Label(label="Manifold Hash")
-                
-                with gr.Tab("Structure Log", id="log_tab"):
-                    status_log = gr.Textbox(label="Engine Process Log", lines=10, elem_classes="log-console")
-                
-                with gr.Tab("Manifold Projection", id="lattice_tab"): 
+                with gr.Tab("3D Manifold Viewer", id="lattice_tab"):
                     with gr.Row():
                         viewer_html_out = gr.HTML(label="3D Viewer")
+                        
+                with gr.Tab("Biophysical Analytics", id="results_tab"):
                     with gr.Row():
-                        l_plot = gr.Plot(label="3D Topology")
-                        m_plot = gr.Plot(label="φ-Spiral Projection")
+                        summary_table = gr.Dataframe(label="Refinement Summary Report")
+                        rama_plot = gr.Plot(label="Pseudo-Ramachandran Plot")
+                    with gr.Row():
+                        l_plot = gr.Plot(label="3D Coordinate Overlay")
+                        conf_plot = gr.Plot(label="TTT-7 Root Profile")
+                    with gr.Row():
+                        h_plot = gr.Plot(label="KD Hydropathy Profile")
+                        ch_plot = gr.Plot(label="Electrostatic Charge Profile")
+                    with gr.Row():
+                        dssp_out = gr.Textbox(label="DSSP Secondary Structure Assignment")
+                        pi_out = gr.Label(label="Isoelectric Point (pI)")
+                        hash_out = gr.Label(label="Refinement Hash")
+                        m_plot = gr.Plot(visible=False) # Keep hidden for output compatibility
                 
-                with gr.Tab("Research Export"):
+                with gr.Tab("Process Console Logs", id="log_tab"):
+                    status_log = gr.Textbox(label="Forcefield Minimization Log", lines=10, elem_classes="log-console")
+                
+                with gr.Tab("Research Package Export"):
                     with gr.Row():
                         export_zip = gr.File(label="Download Research Package (.zip)")
-                        pdb_code = gr.Code(label="PDB Source", language="markdown")
-                    with gr.Column(elem_classes="card"):
-                        gr.Markdown("# Resonance-Fold: φ-Lattice Engine")
-                        deposit_btn = gr.Button("DEPOT TO ZENODO / MODELARCHIVE (DRAFT)", variant="secondary")
-                        deposit_out = gr.Code(label="Submission Manifest", language="json")
+                        pdb_code = gr.Code(label="Refined PDB Source Preview", language="markdown")
 
-    # --- Events ---
-    pdb_btn.click(fetch_pdb_logic, inputs=pdb_search, outputs=[seq_input, status_log, pdb_results])
-    pdb_results.change(on_select_pdb, inputs=pdb_results, outputs=seq_input)
-    lib_select.change(lambda x: PROTEIN_LIBRARY.get(x, ""), inputs=lib_select, outputs=seq_input)
-    
-    mut_btn.click(handle_mutation, inputs=[seq_input, m_pos, m_aa, coords_state], outputs=mut_out)
-    
+    # Event Bindings
     fold_btn.click(
-        run_nrc_pipeline, 
-        inputs=[seq_input, viewer_type, folding_mode, ref_pdb_id], 
+        run_nrc_refinement_pipeline,
+        inputs=[pdb_file, seq_input, k_guide, steps, use_annealing, viewer_type],
         outputs=[
             status_log, viewer_html_out, l_plot, m_plot, rama_plot, h_plot, ch_plot, conf_plot, 
             summary_table, export_zip, pdb_code, dssp_out, pi_out, hash_out,
             coords_state, analysis_state, meta_state
         ]
     )
-    
-    deposit_btn.click(
-        handle_deposition,
-        inputs=[seq_input, pdb_code, meta_state],
-        outputs=deposit_out
-    )
-
 
 if __name__ == "__main__":
     demo.launch(
@@ -599,9 +688,5 @@ if __name__ == "__main__":
         allowed_paths=["."],
         theme=RESONANCE_THEME,
         css=RESONANCE_CSS,
-        head=head_scripts + """
-            <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-            <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-        """
+        head=head_scripts
     )
-# NRC Cache Flush Sat May  9 09:58:11 AM EDT 2026

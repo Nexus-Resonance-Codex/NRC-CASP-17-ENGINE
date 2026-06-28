@@ -207,11 +207,12 @@ class NRCPotential:
             ttt_e = -self.weights["ttt7"] * torch.sum(torch.cos(ttt_factor * (dr - 7.0)))
             total_e = total_e + ttt_e
 
-            # 4. Hydrophobic collapse (Long-range rational potential for global folding)
-            # Use a rational function centered at 4.5 A with width parameter 16.0
-            # to maintain non-zero attractive gradients at long distances (e.g. 10 - 30 A)
+            # 4. Hydrophobic collapse (Long-range rational + Gaussian well)
+            # Use a rational function centered at 4.5 A to maintain long-range gradients
             rational_term = 1.0 / (1.0 + ((d_nb - 4.5) ** 2) / 16.0)
-            hydro_e = self.weights["hydro"] * torch.sum(-self.h_prod_t * rational_term)
+            # Sharp Gaussian well centered at 5.0 A to drive tight ab initio compaction
+            gaussian_term = torch.exp(-((d_nb - 5.0) ** 2) / 4.0)
+            hydro_e = self.weights["hydro"] * torch.sum(-self.h_prod_t * (rational_term + 2.0 * gaussian_term))
             total_e = total_e + hydro_e
 
             # 5. Coulomb electrostatics
@@ -242,6 +243,38 @@ class NRCPotential:
 
             torsion_3_e = self.weights["torsion"] * torch.sum(p_alpha_local3 * (d_3 - 5.1)**2 + p_beta_local3 * (d_3 - 9.8)**2)
             total_e = total_e + torsion_3_e
+
+            # 6.5. Ramachandran-style pseudo-dihedral potential
+            c0 = coords[:-3]
+            c1 = coords[1:-2]
+            c2 = coords[2:-1]
+            c3 = coords[3:]
+
+            b0 = -1.0 * (c1 - c0)
+            b1 = c2 - c1
+            b2 = c3 - c2
+
+            b1_norm = b1 / (torch.norm(b1, dim=1, keepdim=True) + 1e-9)
+
+            v = b0 - torch.sum(b0 * b1_norm, dim=1, keepdim=True) * b1_norm
+            w = b2 - torch.sum(b2 * b1_norm, dim=1, keepdim=True) * b1_norm
+
+            x = torch.sum(v * w, dim=1)
+            y = torch.sum(torch.cross(b1_norm, v, dim=1) * w, dim=1)
+
+            dihedrals = torch.atan2(y, x)
+
+            # Target dihedrals based on Chou-Fasman helical vs sheet propensities
+            # Helix: ~-50 degrees = -0.8727 rad
+            # Sheet: ~+120 degrees = 2.0944 rad
+            p_alpha_local = torch.tensor((self.p_alpha[:-3] + self.p_alpha[1:-2] + self.p_alpha[2:-1] + self.p_alpha[3:]) / 4.0, dtype=torch.float64, device=coords.device)
+            p_beta_local = torch.tensor((self.p_beta[:-3] + self.p_beta[1:-2] + self.p_beta[2:-1] + self.p_beta[3:]) / 4.0, dtype=torch.float64, device=coords.device)
+
+            target_rad = torch.where(p_alpha_local > p_beta_local, -0.8727, 2.0944)
+            w_ramachandran = self.weights.get("torsion", 25.0) * torch.max(p_alpha_local, p_beta_local)
+
+            ramachandran_e = torch.sum(w_ramachandran * (1.0 - torch.cos(dihedrals - target_rad)))
+            total_e = total_e + ramachandran_e
 
         # Reconstruct coordinate frames
         rot = reconstruct_backbone_frames_t(coords)
