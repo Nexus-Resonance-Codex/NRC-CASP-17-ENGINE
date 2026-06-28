@@ -162,6 +162,7 @@ class NRCEngine:
         steps: int = 40,
         max_disp: float = 0.05,
         contacts: Optional[list] = None,
+        use_annealing: bool = False,
     ) -> Generator[Dict, None, None]:
         """
         Fold a single protein sequence.
@@ -195,6 +196,7 @@ class NRCEngine:
             steps=steps,
             max_disp=max_disp,
             contacts=contacts,
+            use_annealing=use_annealing,
         )
 
 
@@ -211,6 +213,7 @@ class NRCEngine:
         max_disp: float = 0.05,
         ensemble_model_idx: Optional[int] = None,
         contacts: Optional[list] = None,
+        use_annealing: bool = False,
     ) -> Generator[Dict, None, None]:
         """
         Fold a multi-chain protein complex.
@@ -300,167 +303,71 @@ class NRCEngine:
                 lattice[start_idx : start_idx + n] = (
                     chain_lattice + subunit_offset
                 )
-                start_idx += n
         else:
-            # Models 1-4: Physical relaxation
-            if k_guide == 0.0 or not has_guides:
-                from .forcefield import NRCForcefield
-                start_idx = 0
-                for c_idx, seq in enumerate(sequences):
-                    n = len(seq)
-                    # Filter and adjust contacts local to this subunit
-                    chain_contacts = None
-                    if contacts is not None:
-                        chain_contacts = []
-                        start_res = start_idx
-                        end_res = start_idx + n
-                        for c in contacts:
-                            i, j = c[0], c[1]
-                            if start_res <= i < end_res and start_res <= j < end_res:
-                                new_c = (i - start_res, j - start_res) + c[2:]
-                                chain_contacts.append(new_c)
-                    ff = NRCForcefield(seq, contacts=chain_contacts)
-                    opt_coords = ff.optimize(max_iter=steps * 10)
-                    lattice[start_idx : start_idx + n] = opt_coords
-                    start_idx += n
+            # Models 1-4: Physical relaxation (unified under NRCForcefield)
+            from .forcefield import NRCForcefield
+            start_idx = 0
+            for c_idx, seq in enumerate(sequences):
+                n = len(seq)
+                
+                # Fetch guide coordinates for this subunit if guides are present
+                chain_guide_coords = None
+                if has_guides and ref_ca_list[c_idx] is not None:
+                    ref_ca = ref_ca_list[c_idx]
+                    
+                    # Apply ensemble perturbation for Models 3-4 (model idx > 1)
+                    if ensemble_model_idx is not None and ensemble_model_idx > 1:
+                        perturbed = np.copy(ref_ca)
+                        amplitude = 1.5 * ensemble_model_idx
+                        period = 30.0
+                        phase = 2.0 * np.pi * ensemble_model_idx / 4.0
 
-            else:
-                start_idx = 0
-                for c_idx, seq in enumerate(sequences):
-                    n = len(seq)
+                        for i in range(len(ref_ca)):
+                            if i == 0:
+                                t_vec = ref_ca[min(1, len(ref_ca) - 1)] - ref_ca[0]
+                            else:
+                                t_vec = ref_ca[i] - ref_ca[i - 1]
+                            t_norm = np.linalg.norm(t_vec)
+                            t_vec = t_vec / t_norm if t_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
 
-                    if has_guides:
-                        ref_ca = ref_ca_list[c_idx]
-                        m_len = min(len(ref_ca), n)
+                            n_vec = np.array([t_vec[1], -t_vec[0], 0.0])
+                            n_norm = np.linalg.norm(n_vec)
+                            n_vec = n_vec / n_norm if n_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
 
-                        # Perturbed reference for Models 3-4
-                        if (
-                            ensemble_model_idx is not None
-                            and ensemble_model_idx > 1
-                        ):
-                            perturbed = np.copy(ref_ca)
-                            amplitude = 1.5 * ensemble_model_idx
-                            period = 30.0
-                            phase = 2.0 * np.pi * ensemble_model_idx / 4.0
-
-                            for i in range(len(ref_ca)):
-                                if i == 0:
-                                    t_vec = (
-                                        ref_ca[min(1, len(ref_ca) - 1)] - ref_ca[0]
-                                    )
-                                else:
-                                    t_vec = ref_ca[i] - ref_ca[i - 1]
-                                t_norm = np.linalg.norm(t_vec)
-                                t_vec = (
-                                    t_vec / t_norm
-                                    if t_norm > 1e-6
-                                    else np.array([0.0, 0.0, 1.0])
-                                )
-
-                                n_vec = np.array([t_vec[1], -t_vec[0], 0.0])
-                                n_norm = np.linalg.norm(n_vec)
-                                n_vec = (
-                                    n_vec / n_norm
-                                    if n_norm > 1e-6
-                                    else np.array([1.0, 0.0, 0.0])
-                                )
-
-                                shift = amplitude * np.sin(
-                                    2.0 * np.pi * i / period + phase
-                                )
-                                perturbed[i] = ref_ca[i] + shift * n_vec
-                            ref_ca_to_use = perturbed
-                        else:
-                            ref_ca_to_use = ref_ca
-
-                        # Build starting coordinates trace (3.8 Å CA-CA)
-                        chain_lattice = np.zeros((n, 3), dtype=self.precision)
-                        chain_lattice[0] = ref_ca_to_use[0]
-                        for i in range(1, m_len):
-                            v = ref_ca_to_use[i] - chain_lattice[i - 1]
-                            dist = np.linalg.norm(v) + 1e-9
-                            chain_lattice[i] = chain_lattice[i - 1] + (
-                                v / dist
-                            ) * 3.8
-
-                        if m_len < n:
-                            for i in range(m_len, n):
-                                chain_lattice[i] = chain_lattice[i - 1] + np.array(
-                                    [0.0, 0.0, 3.8]
-                                )
+                            shift = amplitude * np.sin(2.0 * np.pi * i / period + phase)
+                            perturbed[i] = ref_ca[i] + shift * n_vec
+                        chain_guide_coords = perturbed
                     else:
-                        chain_lattice = self._initialize_lattice(n)
-
-                    subunit_offset = np.array(
-                        [c_idx * 150.0, 0.0, 0.0], dtype=self.precision
-                    )
-                    lattice[start_idx : start_idx + n] = (
-                        chain_lattice + subunit_offset
-                    )
-                    start_idx += n
-
-                # ---- 40-Step Relaxation Loop ----
-                for step in range(1, steps + 1):
-                    # 1. TTT-7 resonance potential forces
-                    ttt_forces = self._apply_ttt_resonance_field(lattice, step)
-
-                    # 2. Steric clash repulsion (exclude |i-j| < 3 on same chain)
-                    steric_forces = np.zeros_like(lattice)
-                    repulsion_dist = 4.0 if step < steps else 4.4
-                    for i in range(total_n):
-                        diffs = lattice[i] - lattice[i + 1 :]
-                        dists = np.linalg.norm(diffs, axis=-1) + 1e-9
-                        clashes = dists < repulsion_dist
-                        if np.any(clashes):
-                            indices = np.where(clashes)[0] + i + 1
-                            for idx in indices:
-                                if (
-                                    chain_of_res[i] != chain_of_res[idx]
-                                    or (idx - i) >= 3
-                                ):
-                                    vec = lattice[i] - lattice[idx]
-                                    norm_vec = vec / (np.linalg.norm(vec) + 1e-9)
-                                    push = (
-                                        norm_vec
-                                        * (repulsion_dist - np.linalg.norm(vec))
-                                        * 1.1
-                                    )
-                                    steric_forces[i] += push * 0.5
-                                    steric_forces[idx] -= push * 0.5
-
-                    # 3. Harmonic guide constraint forces
-                    guide_forces = np.zeros_like(lattice)
-                    if k_guide > 0.0 and has_guides:
-                        start_idx = 0
-                        for c_idx, seq in enumerate(sequences):
-                            ref_ca = ref_ca_list[c_idx]
-                            m_len = min(len(ref_ca), len(seq))
-                            for i in range(m_len):
-                                idx = start_idx + i
-                                guide_forces[idx] = k_guide * (
-                                    ref_ca[i] - lattice[idx]
-                                )
-                            start_idx += len(seq)
-
-                    # 4. Combine and constrain forces
-                    combined_forces = ttt_forces + steric_forces + guide_forces
-                    for i in range(total_n):
-                        force_norm = np.linalg.norm(combined_forces[i])
-                        if force_norm > max_disp:
-                            combined_forces[i] = (
-                                combined_forces[i] / (force_norm + 1e-9)
-                            ) * max_disp
-
-                    lattice += combined_forces
-
-                    # 5. Enforce rigid covalent bond lengths (3.8 Å CA-CA)
-                    start_idx = 0
-                    for cl in chain_lengths:
-                        for i in range(start_idx + 1, start_idx + cl):
-                            vec = lattice[i] - lattice[i - 1]
-                            dist = np.linalg.norm(vec) + 1e-9
-                            lattice[i] = lattice[i - 1] + vec * (3.8 / dist)
-                        start_idx += cl
+                        chain_guide_coords = ref_ca
+                
+                # Filter and adjust contacts local to this subunit
+                chain_contacts = None
+                if contacts is not None:
+                    chain_contacts = []
+                    start_res = start_idx
+                    end_res = start_idx + n
+                    for c in contacts:
+                        i, j = c[0], c[1]
+                        if start_res <= i < end_res and start_res <= j < end_res:
+                            new_c = (i - start_res, j - start_res) + c[2:]
+                            chain_contacts.append(new_c)
+                
+                # Use unified forcefield with guide constraint if active (k_guide > 0.0)
+                ff = NRCForcefield(
+                    seq, 
+                    contacts=chain_contacts, 
+                    guide_coords=chain_guide_coords, 
+                    k_guide=k_guide
+                )
+                
+                # Run L-BFGS-B or Simulated Annealing
+                opt_coords = ff.optimize(max_iter=steps * 10, use_annealing=use_annealing)
+                
+                # Apply a translation offset of 150A per subunit along the X-axis
+                # to separate subunits in space and avoid inter-subunit steric clashes
+                subunit_offset = np.array([c_idx * 150.0, 0.0, 0.0], dtype=self.precision)
+                lattice[start_idx : start_idx + n] = opt_coords + subunit_offset
+                start_idx += n
 
         # 3. Covariant All-Atom Projection Frame
         atom_lib = NRCAtoms()
@@ -495,6 +402,18 @@ class NRCEngine:
 
         # Yield final structure
         coords_array = np.array(frame_coords, dtype=np.float32)
+        
+        # Apply TTT-7 modular root stabilization post-processing to avoid Chaotic Void {3, 6, 9}
+        total_sum = np.sum(np.abs(coords_array)) * 1000.0
+        root = (int(round(total_sum)) - 1) % 9 + 1
+        if root in [3, 6, 9]:
+            shift = 0.001
+            if (root + 1) % 9 not in [0, 3, 6]:
+                shift = 0.001
+            else:
+                shift = 0.002
+            coords_array[0, 0] += shift
+
         confidence_array = np.full(
             len(frame_coords), 100.0, dtype=np.float32
         )

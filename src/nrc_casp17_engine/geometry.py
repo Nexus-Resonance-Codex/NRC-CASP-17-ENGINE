@@ -77,26 +77,40 @@ def fragment_based_initialization(sequence: str, p_alpha: np.ndarray, p_beta: np
 def reconstruct_backbone_frames_t(coords: torch.Tensor) -> torch.Tensor:
     """
     Reconstruct local N x 3 x 3 coordinate frames for H-bonding and side-chains.
+    R_i = [x_i, y_i, u_i] where Column 3 is the bond vector, Column 1 is orthogonal.
     """
     N = coords.shape[0]
-    if N > 2:
-        v_prev = coords[1:] - coords[:-1]
-        d_prev = torch.norm(v_prev, dim=1, keepdim=True) + 1e-9
-        u_prev = v_prev / d_prev
+    if N > 1:
+        u_i_raw = coords[1:] - coords[:-1]
+        u_i = torch.cat([u_i_raw[0:1], u_i_raw], dim=0)
+        u_i = u_i / (torch.norm(u_i, dim=1, keepdim=True) + 1e-9)
 
-        t = u_prev[:-1] + u_prev[1:]
-        t = t / (torch.norm(t, dim=1, keepdim=True) + 1e-9)
+        u_prev_init = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float64, device=coords.device)
+        if N > 2:
+            u_prev = torch.cat([u_prev_init, u_i[1:-1]], dim=0)
+        else:
+            u_prev = u_prev_init[:N]
 
-        n = torch.cross(u_prev[:-1], u_prev[1:], dim=1)
-        n = n / (torch.norm(n, dim=1, keepdim=True) + 1e-9)
+        x_vec = torch.cross(u_i, u_prev, dim=1)
+        x_norm = torch.norm(x_vec, dim=1, keepdim=True)
 
-        b = torch.cross(t, n, dim=1)
-        rot_mid = torch.stack([t, n, b], dim=2)
+        fallback_x = torch.where(
+            torch.abs(u_i[:, 2:3]) < 0.9,
+            torch.stack([u_i[:, 1], -u_i[:, 0], torch.zeros_like(u_i[:, 0])], dim=1),
+            torch.stack([torch.zeros_like(u_i[:, 0]), u_i[:, 2], -u_i[:, 1]], dim=1)
+        )
+        fallback_x = fallback_x / (torch.norm(fallback_x, dim=1, keepdim=True) + 1e-9)
         
-        # Pad boundaries
-        rot = torch.cat([rot_mid[0:1], rot_mid, rot_mid[-1:]], dim=0)
+        x_norm_safe = torch.where(x_norm < 1e-3, torch.ones_like(x_norm), x_norm)
+        x_vec_normalized = x_vec / x_norm_safe
+        x_vec = torch.where(x_norm < 1e-3, fallback_x, x_vec_normalized)
+
+        y_vec = torch.cross(u_i, x_vec, dim=1)
+        y_vec = y_vec / (torch.norm(y_vec, dim=1, keepdim=True) + 1e-9)
+
+        rot = torch.stack([x_vec, y_vec, u_i], dim=2)
     else:
-        rot = torch.eye(3, dtype=torch.float64).expand(N, 3, 3)
+        rot = torch.eye(3, dtype=torch.float64, device=coords.device).expand(N, 3, 3)
     return rot
 
 
@@ -104,25 +118,7 @@ def reconstruct_backbone_frames_np(coords: np.ndarray) -> np.ndarray:
     """
     Reconstruct local N x 3 x 3 coordinate frames using NumPy.
     """
-    N = coords.shape[0]
-    if N > 2:
-        v_prev = coords[1:] - coords[:-1]
-        d_prev = np.linalg.norm(v_prev, axis=1, keepdims=True) + 1e-9
-        u_prev = v_prev / d_prev
-
-        t = u_prev[:-1] + u_prev[1:]
-        t = t / (np.linalg.norm(t, axis=1, keepdims=True) + 1e-9)
-
-        n = np.cross(u_prev[:-1], u_prev[1:], axis=1)
-        n = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
-
-        b = np.cross(t, n, axis=1)
-        rot_mid = np.stack([t, n, b], axis=2)
-        
-        rot = np.concatenate([rot_mid[0:1], rot_mid, rot_mid[-1:]], axis=0)
-    else:
-        rot = np.repeat(np.eye(3)[np.newaxis, :, :], N, axis=0)
-    return rot
+    return reconstruct_frenet_frames_np(coords, start_idx=0)
 
 def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.ndarray:
     """

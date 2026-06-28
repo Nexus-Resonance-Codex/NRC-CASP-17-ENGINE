@@ -34,6 +34,13 @@ EEF1_VOLUME = {
     "P": 59.8, "S": 39.4, "T": 57.0, "W": 139.7, "Y": 118.4, "V": 74.0
 }
 
+# Sidechain radii from CB (Audited for physical extension)
+SIDECHAIN_RADII = {
+    "A": 0.5, "G": 0.0, "V": 1.2, "L": 2.3, "I": 2.0, "M": 3.8, "F": 4.5,
+    "Y": 5.9, "W": 5.0, "S": 1.0, "T": 1.2, "C": 1.8, "P": 1.5, "N": 2.3,
+    "Q": 3.8, "D": 2.3, "E": 3.8, "H": 3.5, "K": 6.0, "R": 6.9
+}
+
 
 class NRCPotential:
     """
@@ -41,11 +48,13 @@ class NRCPotential:
     Calculates PyTorch-based energy potentials.
     """
 
-    def __init__(self, sequence: str, weights: dict, contacts: list = None, charges: np.ndarray = None):
+    def __init__(self, sequence: str, weights: dict, contacts: list = None, charges: np.ndarray = None, guide_coords: np.ndarray = None, k_guide: float = 0.0):
         self.sequence = sequence
         self.N_res = len(sequence)
         self.weights = weights
         self.contacts = contacts
+        self.guide_coords = guide_coords
+        self.k_guide = k_guide
         
         # Precomputations
         self.h_pos = np.array([max(0.0, KYTE_DOOLITTLE.get(aa, 0.0)) for aa in sequence])
@@ -54,16 +63,116 @@ class NRCPotential:
         self.dg_ref = np.array([EEF1_DG_REF.get(aa, 0.0) for aa in sequence])
         self.vol = np.array([EEF1_VOLUME.get(aa, 0.0) for aa in sequence])
         self.has_cb = np.array([aa != 'G' for aa in sequence], dtype=bool)
-
+        self.r_sc = np.array([SIDECHAIN_RADII.get(aa, 1.5) for aa in sequence])
         self.charges = charges if charges is not None else np.zeros(self.N_res)
         self.RG_TARGET = 3.0 * (self.N_res**0.33)
         self.MODULAR_SCALE = 3.8017
+
+        # Convert properties to tensors
+        self.h_pos_t = torch.tensor(self.h_pos, dtype=torch.float64)
+        self.charges_t = torch.tensor(self.charges, dtype=torch.float64)
+        self.p_alpha_t = torch.tensor(self.p_alpha, dtype=torch.float64)
+        self.p_beta_t = torch.tensor(self.p_beta, dtype=torch.float64)
+        self.vol_t = torch.tensor(self.vol, dtype=torch.float64)
+        self.dg_ref_t = torch.tensor(self.dg_ref, dtype=torch.float64)
+        self.r_sc_t = torch.tensor(self.r_sc, dtype=torch.float64)
+
+        # Precompute non-bonded masks and property products
+        mask = np.triu(np.ones((self.N_res, self.N_res), dtype=bool), k=3)
+        if np.any(mask):
+            idx_i, idx_j = np.where(mask)
+            self.idx_i_t = torch.tensor(idx_i, dtype=torch.long)
+            self.idx_j_t = torch.tensor(idx_j, dtype=torch.long)
+            self.h_prod_t = self.h_pos_t[self.idx_i_t] * self.h_pos_t[self.idx_j_t]
+            self.q_prod_t = self.charges_t[self.idx_i_t] * self.charges_t[self.idx_j_t]
+            self.has_nb = True
+        else:
+            self.has_nb = False
+
+        # Precompute C-beta masks and property selections
+        mask_cb = np.triu(np.ones((self.N_res, self.N_res), dtype=bool), k=2)
+        if np.any(mask_cb):
+            idx_i_cb, idx_j_cb = np.where(mask_cb)
+            valid_cb_pairs = self.has_cb[idx_i_cb] & self.has_cb[idx_j_cb]
+            if np.any(valid_cb_pairs):
+                self.idx_i_cb_f_t = torch.tensor(idx_i_cb[valid_cb_pairs], dtype=torch.long)
+                self.idx_j_cb_f_t = torch.tensor(idx_j_cb[valid_cb_pairs], dtype=torch.long)
+                self.vol_i_t = self.vol_t[self.idx_i_cb_f_t]
+                self.vol_j_t = self.vol_t[self.idx_j_cb_f_t]
+                self.dg_ref_i_t = self.dg_ref_t[self.idx_i_cb_f_t]
+                self.dg_ref_j_t = self.dg_ref_t[self.idx_j_cb_f_t]
+                self.sc_thresholds_t = self.r_sc_t[self.idx_i_cb_f_t] + self.r_sc_t[self.idx_j_cb_f_t] + 1.2
+                self.has_cb_pairs = True
+            else:
+                self.has_cb_pairs = False
+        else:
+            self.has_cb_pairs = False
 
         # Backbone vectors
         self.r_N_rel = torch.tensor([-1.46, 0.0, 0.0], dtype=torch.float64)
         self.r_C_rel = torch.tensor([1.52, 0.0, 0.0], dtype=torch.float64)
         self.r_O_rel = torch.tensor([2.15, 1.0, 0.0], dtype=torch.float64)
         self.r_CB_rel = torch.tensor([-0.53, -1.22, -0.75], dtype=torch.float64)
+
+        # Build all-atom lists for differentiable clash check
+        from .atoms import NRCAtoms
+        self.atom_lib = NRCAtoms()
+        
+        all_rel_coords = []
+        all_res_idx = []
+        all_atom_names = []
+        
+        for i, aa in enumerate(sequence):
+            res_dict = self.atom_lib.get_full_residue(aa, np.zeros(3), np.eye(3))
+            for atom_name, rel_coord in res_dict.items():
+                all_rel_coords.append(rel_coord)
+                all_res_idx.append(i)
+                all_atom_names.append(atom_name)
+                
+        self.M_atoms = len(all_rel_coords)
+        self.rel_coords_t = torch.tensor(np.array(all_rel_coords), dtype=torch.float64)
+        self.res_idx_t = torch.tensor(all_res_idx, dtype=torch.long)
+        
+        # Build non-bonded atom pairs with spatial and sequence filtering
+        idx_a = []
+        idx_b = []
+        
+        close_residue_pairs = np.zeros((self.N_res, self.N_res), dtype=bool)
+        for i in range(self.N_res):
+            for j in range(i + 1, self.N_res):
+                if j - i <= 4:
+                    close_residue_pairs[i, j] = True
+                elif self.guide_coords is not None:
+                    guide_dist = np.linalg.norm(self.guide_coords[i] - self.guide_coords[j])
+                    cutoff = 12.0 if self.k_guide > 0.01 else 22.0
+                    if guide_dist < cutoff:
+                        close_residue_pairs[i, j] = True
+                else:
+                    close_residue_pairs[i, j] = True
+
+        for a in range(self.M_atoms):
+            for b in range(a + 1, self.M_atoms):
+                res_a = all_res_idx[a]
+                res_b = all_res_idx[b]
+                name_a = all_atom_names[a]
+                name_b = all_atom_names[b]
+                
+                # Exclude if same residue
+                if res_a == res_b:
+                    continue
+                # Exclude peptide bond (C_i and N_i+1)
+                if res_b == res_a + 1 and name_a == "C" and name_b == "N":
+                    continue
+                if res_a == res_b + 1 and name_a == "N" and name_b == "C":
+                    continue
+                    
+                # Only include if residues are close
+                if close_residue_pairs[res_a, res_b] or close_residue_pairs[res_b, res_a]:
+                    idx_a.append(a)
+                    idx_b.append(b)
+                
+        self.atom_idx_a_t = torch.tensor(idx_a, dtype=torch.long)
+        self.atom_idx_b_t = torch.tensor(idx_b, dtype=torch.long)
 
     def compute_energy(self, coords: torch.Tensor) -> torch.Tensor:
         """Compute the total potential energy of the given coordinates."""
@@ -78,10 +187,8 @@ class NRCPotential:
         total_e = total_e + bond_e
 
         # Non-bonded terms mask (j - i >= 3)
-        mask = np.triu(np.ones((N, N), dtype=bool), k=3)
-        if np.any(mask):
-            idx_i, idx_j = np.where(mask)
-            diff_nb = coords[idx_i] - coords[idx_j]
+        if self.has_nb:
+            diff_nb = coords[self.idx_i_t] - coords[self.idx_j_t]
             d_nb = torch.norm(diff_nb, dim=1) + 1e-9
 
             # 2. Steric repulsion (clash check)
@@ -100,15 +207,15 @@ class NRCPotential:
             ttt_e = -self.weights["ttt7"] * torch.sum(torch.cos(ttt_factor * (dr - 7.0)))
             total_e = total_e + ttt_e
 
-            # 4. Hydrophobic collapse
-            h_prod = torch.tensor(self.h_pos[idx_i] * self.h_pos[idx_j], dtype=torch.float64)
-            exp_term = torch.exp(-0.5 * (d_nb - 4.5)**2)
-            hydro_e = self.weights["hydro"] * torch.sum(-h_prod * exp_term)
+            # 4. Hydrophobic collapse (Long-range rational potential for global folding)
+            # Use a rational function centered at 4.5 A with width parameter 16.0
+            # to maintain non-zero attractive gradients at long distances (e.g. 10 - 30 A)
+            rational_term = 1.0 / (1.0 + ((d_nb - 4.5) ** 2) / 16.0)
+            hydro_e = self.weights["hydro"] * torch.sum(-self.h_prod_t * rational_term)
             total_e = total_e + hydro_e
 
             # 5. Coulomb electrostatics
-            q_prod = torch.tensor(self.charges[idx_i] * self.charges[idx_j], dtype=torch.float64)
-            elec_e = self.weights["elec"] * torch.sum(q_prod / d_nb**2)
+            elec_e = self.weights["elec"] * torch.sum(self.q_prod_t / d_nb**2)
             total_e = total_e + elec_e
 
         # 6. Local pseudo-torsions (distances i to i+2 and i to i+3)
@@ -222,37 +329,48 @@ class NRCPotential:
             total_e = total_e + self.weights["contact"] * contact_e
 
         # 10. Explicit Side-Chain Centroids (CB) & Solvation (EEF1)
-        if N > 2:
+        if N > 2 and self.has_cb_pairs:
             r_CB = coords + torch.matmul(rot, self.r_CB_rel)
+            diff_cb = r_CB[self.idx_i_cb_f_t] - r_CB[self.idx_j_cb_f_t]
+            d_cb = torch.norm(diff_cb, dim=1) + 1e-9
             
-            mask_cb = np.triu(np.ones((N, N), dtype=bool), k=2)
-            if np.any(mask_cb):
-                idx_i_cb, idx_j_cb = np.where(mask_cb)
+            # Centroid steric repulsion using residue-specific sidechain radii + 1.2A clearance
+            clash_cb = d_cb < self.sc_thresholds_t
+            if torch.any(clash_cb):
+                cb_steric_e = self.weights["centroid_steric"] * torch.sum((self.sc_thresholds_t[clash_cb] - d_cb[clash_cb])**2)
+                total_e = total_e + cb_steric_e
                 
-                valid_cb_pairs = torch.tensor(self.has_cb[idx_i_cb] & self.has_cb[idx_j_cb], dtype=torch.bool)
-                if torch.any(valid_cb_pairs):
-                    idx_i_cb_f = idx_i_cb[valid_cb_pairs]
-                    idx_j_cb_f = idx_j_cb[valid_cb_pairs]
-                    
-                    diff_cb = r_CB[idx_i_cb_f] - r_CB[idx_j_cb_f]
-                    d_cb = torch.norm(diff_cb, dim=1) + 1e-9
-                    
-                    # Centroid steric repulsion
-                    clash_cb = d_cb < 3.5
-                    if torch.any(clash_cb):
-                        cb_steric_e = self.weights["centroid_steric"] * torch.sum((3.5 - d_cb[clash_cb])**2)
-                        total_e = total_e + cb_steric_e
-                        
-                    # EEF1 Solvation
-                    vol_i = torch.tensor(self.vol[idx_i_cb_f], dtype=torch.float64)
-                    vol_j = torch.tensor(self.vol[idx_j_cb_f], dtype=torch.float64)
-                    dg_ref_i = torch.tensor(self.dg_ref[idx_i_cb_f], dtype=torch.float64)
-                    dg_ref_j = torch.tensor(self.dg_ref[idx_j_cb_f], dtype=torch.float64)
-                    
-                    desolv_ij = vol_j * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
-                    desolv_ji = vol_i * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
-                    
-                    solv_e = self.weights["solvation"] * torch.sum(dg_ref_i * desolv_ij + dg_ref_j * desolv_ji)
-                    total_e = total_e + solv_e
+            # EEF1 Solvation
+            desolv_ij = self.vol_j_t * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
+            desolv_ji = self.vol_i_t * torch.exp(-(d_cb**2) / (2.0 * 3.5**2))
+            
+            # Fix sign error: desolvation is attractive for hydrophobic residues (dg_ref > 0)
+            solv_e = -self.weights["solvation"] * torch.sum(self.dg_ref_i_t * desolv_ij + self.dg_ref_j_t * desolv_ji)
+            total_e = total_e + solv_e
+
+        # 10.5. All-Atom Pairwise Steric Clash potential (Hard Wall)
+        rel_coords_dev = self.rel_coords_t.to(coords.device)
+        res_idx_dev = self.res_idx_t.to(coords.device)
+        atom_idx_a_dev = self.atom_idx_a_t.to(coords.device)
+        atom_idx_b_dev = self.atom_idx_b_t.to(coords.device)
+
+        rot_selected = rot[res_idx_dev]
+        rel_rotated = torch.bmm(rot_selected, rel_coords_dev.unsqueeze(2)).squeeze(2)
+        coords_all = coords[res_idx_dev] + rel_rotated
+
+        diff_atoms = coords_all[atom_idx_a_dev] - coords_all[atom_idx_b_dev]
+        d_atoms = torch.norm(diff_atoms, dim=1) + 1e-9
+
+        clash_atoms_mask = d_atoms < 1.30
+        if torch.any(clash_atoms_mask):
+            all_clash_e = self.weights["steric"] * 10000.0 * torch.sum((1.30 - d_atoms[clash_atoms_mask])**2)
+            total_e = total_e + all_clash_e
+
+        # 11. C-alpha Harmonic Guide Constraint
+        if self.guide_coords is not None and self.k_guide > 0.0:
+            guide_coords_t = torch.tensor(self.guide_coords, dtype=torch.float64)
+            m_len = min(len(guide_coords_t), N)
+            guide_e = self.k_guide * torch.sum((coords[:m_len] - guide_coords_t[:m_len])**2)
+            total_e = total_e + guide_e
 
         return total_e

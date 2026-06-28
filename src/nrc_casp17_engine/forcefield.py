@@ -22,10 +22,12 @@ class NRCForcefield:
     All-Atom and CA-Lattice Ab Initio Thermodynamic Forcefield.
     """
 
-    def __init__(self, sequence: str, weights: dict = None, contacts: list = None):
+    def __init__(self, sequence: str, weights: dict = None, contacts: list = None, guide_coords: np.ndarray = None, k_guide: float = 0.0):
         self.sequence = sequence
         self.N_res = len(sequence)
         self.contacts = contacts
+        self.guide_coords = guide_coords
+        self.k_guide = k_guide
 
         self.chem = NRCChemistry()
         self.atom_lib = NRCAtoms()
@@ -68,11 +70,26 @@ class NRCForcefield:
             sequence=self.sequence,
             weights=self.weights,
             contacts=self.contacts,
-            charges=self.charges
+            charges=self.charges,
+            guide_coords=self.guide_coords,
+            k_guide=self.k_guide
         )
 
-        # Set up coordinates using the new geometry initializer
-        self.x0 = self.fragment_based_initialization(self.N_res)
+        # Set up coordinates using the new geometry initializer or guide coordinates
+        if self.guide_coords is not None:
+            m_len = min(len(self.guide_coords), self.N_res)
+            chain_lattice = np.zeros((self.N_res, 3), dtype=np.float64)
+            chain_lattice[0] = self.guide_coords[0]
+            for i in range(1, m_len):
+                v = self.guide_coords[i] - chain_lattice[i - 1]
+                dist = np.linalg.norm(v) + 1e-9
+                chain_lattice[i] = chain_lattice[i - 1] + (v / dist) * 3.8
+            if m_len < self.N_res:
+                for i in range(m_len, self.N_res):
+                    chain_lattice[i] = chain_lattice[i - 1] + np.array([0.0, 0.0, 3.8])
+            self.x0 = chain_lattice.flatten()
+        else:
+            self.x0 = self.fragment_based_initialization(self.N_res)
 
         # Initialize optimizer
         self.optimizer = NRCOptimizer(self.energy_and_gradient)
