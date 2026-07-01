@@ -301,6 +301,7 @@ class NRCEngine:
                 lattice[start_idx : start_idx + n] = (
                     chain_lattice + subunit_offset
                 )
+                start_idx += n
         else:
             # Models 1-4: Physical relaxation (unified under NRCForcefield)
             from .forcefield import NRCForcefield
