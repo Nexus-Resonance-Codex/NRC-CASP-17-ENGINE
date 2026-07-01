@@ -553,20 +553,23 @@ def run_nrc_refinement_pipeline(pdb_file, seq_input, k_guide, steps, use_anneali
         ttt_roots = []
         ca_coords = coords_opt[np.array(atom_types) == "CA"]
         for c in ca_coords:
-            dr = int(round(np.sum(np.abs(c)) * 1000.0) - 1) % 9 + 1
+            raw = float(np.sum(np.abs(c))) * 1000.0
+            dr = (int(round(raw)) - 1) % 9 + 1
             ttt_roots.append(dr)
         conf_fig = px.line(x=np.arange(len(ttt_roots)), y=ttt_roots, title="TTT-7 Digital Root Profile", template="plotly_dark")
         conf_fig.update_layout(yaxis_range=[0, 10])
         
         # 3D backbone overlay plot
+        ca_ref_all = coords_opt[np.array(atom_types) == "CA"]
         l_fig = go.Figure()
         if original_pdb_text:
+            ca_orig_all = orig_coords[np.array(orig_atom_types) == "CA"]
             l_fig.add_trace(go.Scatter3d(
-                x=ca_orig[:, 0], y=ca_orig[:, 1], z=ca_orig[:, 2],
+                x=ca_orig_all[:, 0], y=ca_orig_all[:, 1], z=ca_orig_all[:, 2],
                 mode='lines+markers', name='Original Structure', line=dict(color='red', width=3)
             ))
         l_fig.add_trace(go.Scatter3d(
-            x=ca_ref[:, 0], y=ca_ref[:, 1], z=ca_ref[:, 2],
+            x=ca_ref_all[:, 0], y=ca_ref_all[:, 1], z=ca_ref_all[:, 2],
             mode='lines+markers', name='Refined Structure', line=dict(color='green', width=3)
         ))
         l_fig.update_layout(template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0), title="3D Trace Overlay")
@@ -663,6 +666,23 @@ with gr.Blocks(title="Resonance-Fold Pro PDB Refiner") as demo:
                 with gr.Tab("Process Console Logs", id="log_tab"):
                     status_log = gr.Textbox(label="Forcefield Minimization Log", lines=10, elem_classes="log-console")
                 
+                with gr.Tab("CASP-17 Batch Mode (5 Models)", id="batch_tab"):
+                    gr.Markdown("""
+### Generate All 5 CASP-17 Submission Models
+Upload a guide PDB (from ESMFold/AlphaFold) and generate all 5 models with the proper protocols:
+- **Model 1**: Guided refinement (k_guide=0.5, backbone locked)
+- **Model 2**: Unconstrained math relaxation (k_guide=0.0, free)
+- **Model 3**: Perturbed + relaxed (amplitude 1.5A, phase 0°)
+- **Model 4**: Perturbed + relaxed (amplitude 3.0A, phase 90°)
+- **Model 5**: Direct template projection (no relaxation)
+                    """)
+                    with gr.Row():
+                        batch_pdb = gr.File(label="Upload Guide PDB for Batch Folding", file_types=[".pdb"])
+                        batch_target_id = gr.Textbox(label="Target ID (e.g. T1406)", placeholder="H2381")
+                    batch_btn = gr.Button("Generate 5 Models & Download ZIP", variant="primary")
+                    batch_out = gr.File(label="Download 5-Model ZIP Package")
+                    batch_log = gr.Textbox(label="Batch Run Log", lines=5, elem_classes="log-console")
+
                 with gr.Tab("Research Package Export"):
                     with gr.Row():
                         export_zip = gr.File(label="Download Research Package (.zip)")
@@ -677,6 +697,75 @@ with gr.Blocks(title="Resonance-Fold Pro PDB Refiner") as demo:
             summary_table, export_zip, pdb_code, dssp_out, pi_out, hash_out,
             coords_state, analysis_state, meta_state
         ]
+    )
+
+    def run_batch_5_models(pdb_file, target_id):
+        """Generate all 5 CASP-17 models from an uploaded guide PDB."""
+        logs = ["[BATCH] Starting 5-model generation..."]
+        
+        if pdb_file is None:
+            return None, "[ERROR] No PDB file uploaded."
+        
+        target_id = target_id.strip().upper() if target_id.strip() else "TARGET"
+        subunits = extract_subunits_from_pdb(pdb_file.name)
+        guide_pdbs = split_pdb_by_chains(pdb_file.name)
+        
+        k_guides = [0.5, 0.0, 0.0, 0.0, 0.0]  # Per model k_guide values
+        model_names = ["Model1_Guided", "Model2_FreeRelax", "Model3_Perturb1", "Model4_Perturb2", "Model5_DirectTemplate"]
+        
+        temp_dir = tempfile.mkdtemp()
+        pdb_paths = []
+        
+        for m_idx in range(5):
+            logs.append(f"[BATCH] Running Model {m_idx+1}/5 (k_guide={k_guides[m_idx]})...")
+            try:
+                final_frame = None
+                for frame in engine.fold_complex(
+                    subunits=subunits,
+                    guide_pdbs=guide_pdbs,
+                    k_guide=k_guides[m_idx],
+                    steps=25,
+                    ensemble_model_idx=m_idx,
+                    use_annealing=False
+                ):
+                    if frame["final"]:
+                        final_frame = frame
+                
+                if final_frame:
+                    seq = "".join([s["sequence"] for s in subunits])
+                    pdb_text = ReportingSuite.generate_pdb(
+                        seq, final_frame["coords"], final_frame["confidence"],
+                        all_atom=True, atom_types=final_frame["atom_types"],
+                        res_indices=final_frame["res_indices"], res_names=final_frame["res_names"]
+                    )
+                    pdb_path = os.path.join(temp_dir, f"{target_id}_{model_names[m_idx]}.pdb")
+                    with open(pdb_path, "w") as f:
+                        f.write(pdb_text)
+                    pdb_paths.append(pdb_path)
+                    logs.append(f"[OK] Model {m_idx+1} complete.")
+                else:
+                    logs.append(f"[WARN] Model {m_idx+1} returned no frame.")
+            except Exception as e:
+                logs.append(f"[ERROR] Model {m_idx+1} failed: {str(e)}")
+        
+        # Cleanup temp guide PDB files
+        for tf in guide_pdbs:
+            try: os.unlink(tf)
+            except: pass
+        
+        # Package into ZIP
+        zip_path = os.path.join(tempfile.gettempdir(), f"{target_id}_5models_{int(datetime.now().timestamp())}.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for p in pdb_paths:
+                zf.write(p, os.path.basename(p))
+        shutil.rmtree(temp_dir)
+        logs.append(f"[DONE] ZIP package ready: {zip_path}")
+        return zip_path, "\n".join(logs)
+
+    batch_btn.click(
+        run_batch_5_models,
+        inputs=[batch_pdb, batch_target_id],
+        outputs=[batch_out, batch_log]
     )
 
 if __name__ == "__main__":

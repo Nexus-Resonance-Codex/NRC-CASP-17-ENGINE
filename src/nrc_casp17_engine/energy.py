@@ -65,7 +65,7 @@ class NRCPotential:
         self.has_cb = np.array([aa != 'G' for aa in sequence], dtype=bool)
         self.r_sc = np.array([SIDECHAIN_RADII.get(aa, 1.5) for aa in sequence])
         self.charges = charges if charges is not None else np.zeros(self.N_res)
-        self.RG_TARGET = 3.0 * (self.N_res**0.33)
+        self.RG_TARGET = 2.2 * (self.N_res ** 0.38)  # Empirical Flory exponent for globular folding
         self.MODULAR_SCALE = 3.8017
 
         # Convert properties to tensors
@@ -208,15 +208,16 @@ class NRCPotential:
             total_e = total_e + ttt_e
 
             # 4. Hydrophobic collapse (Long-range rational + Gaussian well)
-            # Use a rational function centered at 4.5 A to maintain long-range gradients
-            rational_term = 1.0 / (1.0 + ((d_nb - 4.5) ** 2) / 16.0)
-            # Sharp Gaussian well centered at 5.0 A to drive tight ab initio compaction
-            gaussian_term = torch.exp(-((d_nb - 5.0) ** 2) / 4.0)
-            hydro_e = self.weights["hydro"] * torch.sum(-self.h_prod_t * (rational_term + 2.0 * gaussian_term))
+            # Rational well centered at 7.0 A: optimal CA-CA burial distance in globular proteins
+            rational_term = 1.0 / (1.0 + ((d_nb - 7.0) ** 2) / 25.0)
+            # Gaussian well centered at 6.5 A for tight hydrophobic core compaction
+            gaussian_term = torch.exp(-((d_nb - 6.5) ** 2) / 8.0)
+            hydro_e = self.weights["hydro"] * torch.sum(-self.h_prod_t * (rational_term + 1.5 * gaussian_term))
             total_e = total_e + hydro_e
 
-            # 5. Coulomb electrostatics
-            elec_e = self.weights["elec"] * torch.sum(self.q_prod_t / d_nb**2)
+            # 5. Debye-Huckel screened electrostatics (physiological 150mM salt)
+            kappa = 0.1
+            elec_e = self.weights["elec"] * torch.sum(self.q_prod_t * torch.exp(-kappa * d_nb) / (d_nb + 1e-9))
             total_e = total_e + elec_e
 
         # 6. Local pseudo-torsions (distances i to i+2 and i to i+3)

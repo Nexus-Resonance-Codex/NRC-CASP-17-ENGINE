@@ -22,7 +22,7 @@ def fragment_based_initialization(sequence: str, p_alpha: np.ndarray, p_beta: np
     
     # Helix CA parameters
     alpha_angle = 90.0 * np.pi / 180.0
-    alpha_dihedral = 51.853 * np.pi / 180.0  # Special resonance angle
+    alpha_dihedral = 51.82729 * np.pi / 180.0  # Mathematically exact QRT resonance angle
     
     # Beta CA parameters
     beta_angle = 120.0 * np.pi / 180.0

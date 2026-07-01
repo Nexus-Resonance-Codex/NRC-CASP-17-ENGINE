@@ -19,13 +19,13 @@ class NRCOptimizer:
         self.energy_and_gradient_fn = energy_and_gradient_fn
 
     def minimize_lbfgs(self, x0: np.ndarray, max_iter: int = 500) -> np.ndarray:
-        """Run standard L-BFGS-B optimization."""
+        """Run standard L-BFGS-B optimization with tightened tolerances."""
         res = minimize(
             self.energy_and_gradient_fn,
             x0,
             method="L-BFGS-B",
             jac=True,
-            options={"maxiter": max_iter, "gtol": 1e-5},
+            options={"maxiter": max_iter, "gtol": 1e-7, "ftol": 1e-10},
         )
         return res.x
 

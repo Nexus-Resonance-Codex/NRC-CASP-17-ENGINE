@@ -285,11 +285,9 @@ class NRCEngine:
                 m_len = min(len(ref_ca), n)
 
                 chain_lattice = np.zeros((n, 3), dtype=self.precision)
-                chain_lattice[0] = ref_ca[0]
-                for i in range(1, m_len):
-                    v = ref_ca[i] - chain_lattice[i - 1]
-                    dist = np.linalg.norm(v) + 1e-9
-                    chain_lattice[i] = chain_lattice[i - 1] + (v / dist) * 3.8
+                # Model 5: Use raw template coordinates directly (no rigid bond renormalization)
+                for i in range(m_len):
+                    chain_lattice[i] = ref_ca[i]
 
                 if m_len < n:
                     for i in range(m_len, n):
