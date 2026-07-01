@@ -137,13 +137,21 @@ def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.n
             u_prev = np.array([1.0, 0.0, 0.0])
         else:
             u_i = coords[i] - coords[i - 1]
-            u_i /= np.linalg.norm(u_i) + 1e-9
+            u_i_norm = np.linalg.norm(u_i)
+            if u_i_norm < 1e-6:
+                u_i = np.array([0.0, 0.0, 1.0])
+            else:
+                u_i /= u_i_norm
             u_prev = coords[i - 1] - (
                 coords[i - 2]
                 if i - 2 >= 0
                 else coords[i - 1] - np.array([1.0, 0.0, 0.0])
             )
-            u_prev /= np.linalg.norm(u_prev) + 1e-9
+            u_prev_norm = np.linalg.norm(u_prev)
+            if u_prev_norm < 1e-6:
+                u_prev = np.array([1.0, 0.0, 0.0])
+            else:
+                u_prev /= u_prev_norm
 
         x_i = np.cross(u_i, u_prev)
         x_norm = np.linalg.norm(x_i)
@@ -153,12 +161,12 @@ def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.n
                 if abs(u_i[2]) < 0.9
                 else np.array([0.0, u_i[2], -u_i[1]])
             )
-            x_i /= np.linalg.norm(x_i)
+            x_i /= (np.linalg.norm(x_i) + 1e-9)
         else:
             x_i /= x_norm
 
         y_i = np.cross(u_i, x_i)
-        y_i /= np.linalg.norm(y_i)
+        y_i /= (np.linalg.norm(y_i) + 1e-9)
 
         rot[i] = np.column_stack((x_i, y_i, u_i))
     return rot
