@@ -132,20 +132,13 @@ class NRCEngine:
 
         force_mag = 2 * np.pi * k * np.sin(2 * np.pi * dist * k)
 
-        forces = np.zeros_like(lattice)
-        for i in range(n):
-            unit_vectors = diff[i] / (dist[i][:, np.newaxis] + 1e-6)
-            dr_mask = np.array(
-                [(j - 1) % 9 + 1 not in [3, 6, 9] for j in range(n)]
-            )
-
-            combined_mask = mask[i] & dr_mask
-            node_force = np.sum(
-                unit_vectors[combined_mask]
-                * force_mag[i][combined_mask][:, np.newaxis],
-                axis=0,
-            )
-            forces[i] = node_force
+        dr_mask = np.array([(j - 1) % 9 + 1 not in [3, 6, 9] for j in range(n)], dtype=bool)
+        combined_mask = mask & dr_mask[np.newaxis, :]
+        unit_vectors = diff / (dist[:, :, np.newaxis] + 1e-6)
+        forces = np.sum(
+            unit_vectors * force_mag[:, :, np.newaxis] * combined_mask[:, :, np.newaxis],
+            axis=1
+        )
 
         lr = 0.05 / (1 + step * 0.05)
         return forces * lr

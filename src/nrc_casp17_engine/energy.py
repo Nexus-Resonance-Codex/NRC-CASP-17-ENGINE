@@ -78,16 +78,34 @@ class NRCPotential:
         self.r_sc_t = torch.tensor(self.r_sc, dtype=torch.float64)
 
         # Precompute non-bonded masks and property products
-        mask = np.triu(np.ones((self.N_res, self.N_res), dtype=bool), k=3)
-        if np.any(mask):
-            idx_i, idx_j = np.where(mask)
-            self.idx_i_t = torch.tensor(idx_i, dtype=torch.long)
-            self.idx_j_t = torch.tensor(idx_j, dtype=torch.long)
-            self.h_prod_t = self.h_pos_t[self.idx_i_t] * self.h_pos_t[self.idx_j_t]
-            self.q_prod_t = self.charges_t[self.idx_i_t] * self.charges_t[self.idx_j_t]
-            self.has_nb = True
-        else:
+        # For very large proteins (>2000 residues), skip non-bonded interactions to avoid OOM
+        if self.N_res > 2000:
             self.has_nb = False
+        else:
+            mask = np.triu(np.ones((self.N_res, self.N_res), dtype=bool), k=3)
+            if self.guide_coords is not None:
+                close_mask = np.zeros((self.N_res, self.N_res), dtype=bool)
+                for i in range(self.N_res):
+                    for j in range(i + 3, self.N_res):
+                        if j - i <= 6:
+                            close_mask[i, j] = True
+                        elif i < len(self.guide_coords) and j < len(self.guide_coords):
+                            d = np.linalg.norm(self.guide_coords[i] - self.guide_coords[j])
+                            if d < 12.0:
+                                close_mask[i, j] = True
+                        else:
+                            close_mask[i, j] = True
+                mask = mask & close_mask
+
+            if np.any(mask):
+                idx_i, idx_j = np.where(mask)
+                self.idx_i_t = torch.tensor(idx_i, dtype=torch.long)
+                self.idx_j_t = torch.tensor(idx_j, dtype=torch.long)
+                self.h_prod_t = self.h_pos_t[self.idx_i_t] * self.h_pos_t[self.idx_j_t]
+                self.q_prod_t = self.charges_t[self.idx_i_t] * self.charges_t[self.idx_j_t]
+                self.has_nb = True
+            else:
+                self.has_nb = False
 
         # Precompute C-beta masks and property selections
         mask_cb = np.triu(np.ones((self.N_res, self.N_res), dtype=bool), k=2)
@@ -143,31 +161,32 @@ class NRCPotential:
                 if j - i <= 4:
                     close_residue_pairs[i, j] = True
                 elif self.guide_coords is not None:
-                    guide_dist = np.linalg.norm(self.guide_coords[i] - self.guide_coords[j])
-                    cutoff = 12.0 if self.k_guide > 0.01 else 22.0
-                    if guide_dist < cutoff:
+                    if i < len(self.guide_coords) and j < len(self.guide_coords):
+                        guide_dist = np.linalg.norm(self.guide_coords[i] - self.guide_coords[j])
+                        cutoff = 12.0 if self.k_guide > 0.01 else 22.0
+                        if guide_dist < cutoff:
+                            close_residue_pairs[i, j] = True
+                    else:
                         close_residue_pairs[i, j] = True
                 else:
                     close_residue_pairs[i, j] = True
 
-        for a in range(self.M_atoms):
-            for b in range(a + 1, self.M_atoms):
-                res_a = all_res_idx[a]
-                res_b = all_res_idx[b]
+
+        atoms_by_res = [[] for _ in range(self.N_res)]
+        for a, r in enumerate(all_res_idx):
+            atoms_by_res[r].append(a)
+
+        r_a_indices, r_b_indices = np.where(close_residue_pairs)
+        for r_a, r_b in zip(r_a_indices, r_b_indices):
+            for a in atoms_by_res[r_a]:
                 name_a = all_atom_names[a]
-                name_b = all_atom_names[b]
-                
-                # Exclude if same residue
-                if res_a == res_b:
-                    continue
-                # Exclude peptide bond (C_i and N_i+1)
-                if res_b == res_a + 1 and name_a == "C" and name_b == "N":
-                    continue
-                if res_a == res_b + 1 and name_a == "N" and name_b == "C":
-                    continue
-                    
-                # Only include if residues are close
-                if close_residue_pairs[res_a, res_b] or close_residue_pairs[res_b, res_a]:
+                for b in atoms_by_res[r_b]:
+                    name_b = all_atom_names[b]
+                    # Exclude peptide bond (C_i and N_i+1)
+                    if r_b == r_a + 1 and name_a == "C" and name_b == "N":
+                        continue
+                    if r_a == r_b + 1 and name_a == "N" and name_b == "C":
+                        continue
                     idx_a.append(a)
                     idx_b.append(b)
                 
@@ -297,16 +316,12 @@ class NRCPotential:
         else:
             r_H = coords.clone()
 
-        # Evaluate H-bonds
-        donor_idx = torch.arange(1, N)
-        acceptor_idx = torch.arange(0, N)
-        d_i, a_j = torch.meshgrid(donor_idx, acceptor_idx, indexing="ij")
-        
-        pair_mask = torch.abs(d_i - a_j) >= 3
-        if torch.any(pair_mask):
-            d_i_flat = d_i[pair_mask]
-            a_j_flat = a_j[pair_mask]
-
+        # Evaluate H-bonds using precomputed filtered non-bonded pairs
+        if self.has_nb:
+            mask1 = self.idx_i_t >= 1
+            d_i_flat = torch.cat([self.idx_i_t[mask1], self.idx_j_t], dim=0)
+            a_j_flat = torch.cat([self.idx_j_t[mask1], self.idx_i_t], dim=0)
+            
             N_coords = r_N[d_i_flat]
             H_coords = r_H[d_i_flat]
             C_coords = r_C[a_j_flat]
