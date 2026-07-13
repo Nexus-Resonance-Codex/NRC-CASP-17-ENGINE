@@ -3,7 +3,7 @@ NRC Mathematical Hyperparameter Calibration
 ===========================================
 
 Performs a deterministic, derivative-free optimization (Nelder-Mead) over the
-forcefield weights parameter space. Calibrates the engine against a diverse set of 
+forcefield weights parameter space. Calibrates the engine against a diverse set of
 experimentally determined PDB structures to minimize global CA-RMSD.
 """
 
@@ -15,10 +15,11 @@ import sys
 from scipy.optimize import minimize
 
 # Add src to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+)
 
 from nrc_casp17_engine.forcefield import NRCForcefield
-from nrc_casp17_engine.biophysics import BiophysicsSuite
 
 
 # 1. Reference PDB list (diverse, small-to-medium proteins)
@@ -93,12 +94,12 @@ def loss_function(weights_vector):
     """
     # Parameter mapping: [hydro, helix, sheet, torsion, elec, rg, steric]
     hydro, helix, sheet, torsion, elec, rg, steric = weights_vector
-    
+
     # Large penalty for negative weights
     penalty = 0.0
     for w in weights_vector:
         if w < 0.0:
-            penalty += 1000.0 * (w ** 2)
+            penalty += 1000.0 * (w**2)
 
     weights_dict = {
         "bond": 5000.0,  # Keep bond constraint rigid
@@ -109,7 +110,7 @@ def loss_function(weights_vector):
         "sheet": max(0.0, sheet),
         "torsion": max(0.0, torsion),
         "elec": max(0.0, elec),
-        "rg": max(0.1, rg)
+        "rg": max(0.1, rg),
     }
 
     rmsds = []
@@ -117,18 +118,20 @@ def loss_function(weights_vector):
         if pdb_id not in native_cache:
             continue
         native = native_cache[pdb_id]
-        
+
         # Instantiate forcefield and optimize
         ff = NRCForcefield(sequence, weights=weights_dict)
         opt_coords = ff.optimize(max_iter=150)
-        
+
         # Calculate RMSD
         rmsd = calculate_rmsd(opt_coords, native)
         rmsds.append(rmsd)
 
     mean_rmsd = np.mean(rmsds) if rmsds else 100.0
     total_loss = mean_rmsd + penalty
-    print(f"Weights: {np.round(weights_vector, 2)} | Mean RMSD: {mean_rmsd:.4f} A | Loss: {total_loss:.4f}")
+    print(
+        f"Weights: {np.round(weights_vector, 2)} | Mean RMSD: {mean_rmsd:.4f} A | Loss: {total_loss:.4f}"
+    )
     return total_loss
 
 
@@ -136,15 +139,15 @@ def run_calibration():
     print("Starting automated hyperparameter search...")
     # Initial guess [hydro, helix, sheet, torsion, elec, rg, steric]
     x0 = [20.0, 10.0, 10.0, 25.0, 5.0, 100.0, 500.0]
-    
+
     # Deterministic Nelder-Mead optimization
     res = minimize(
         loss_function,
         x0,
         method="Nelder-Mead",
-        options={"maxiter": 30, "xatol": 1.0, "fatol": 0.1}
+        options={"maxiter": 30, "xatol": 1.0, "fatol": 0.1},
     )
-    
+
     opt_w = res.x
     final_weights = {
         "bond": 5000.0,
@@ -155,18 +158,22 @@ def run_calibration():
         "sheet": max(0.0, opt_w[2]),
         "torsion": max(0.0, opt_w[3]),
         "elec": max(0.0, opt_w[4]),
-        "rg": max(0.1, opt_w[5])
+        "rg": max(0.1, opt_w[5]),
     }
 
     # Save to src package
     package_dir = os.path.dirname(os.path.abspath(__file__))
-    weights_path = os.path.abspath(os.path.join(package_dir, "..", "src", "nrc_casp17_engine", "force_weights.json"))
+    weights_path = os.path.abspath(
+        os.path.join(
+            package_dir, "..", "src", "nrc_casp17_engine", "force_weights.json"
+        )
+    )
     with open(weights_path, "w") as f:
         json.dump(final_weights, f, indent=4)
-        
+
     print(f"\nOptimization converged. Optimal weights written to {weights_path}:")
     print(json.dumps(final_weights, indent=4))
-    
+
     # Save a dated version to production directory per Project Rules
     # We will copy it to /mnt/2TBext/FOLD-TEMP/CASP-17/SOURCE_SCRIPTS/math_hyperparameter_calibration_06-26-2026.py
     # and /mnt/2TBext/FOLD-TEMP/CASP-17/SOURCE_SCRIPTS/force_weights_06-26-2026.json

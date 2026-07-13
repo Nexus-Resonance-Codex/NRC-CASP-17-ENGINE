@@ -4,7 +4,7 @@ NRC Engine — Pure Math Deterministic Polymer Physics Engine v4.0
 
 The core folding engine for CASP-17. Implements:
 - Torsion-angle forward kinematics
-- φ-spiral lattice initialization  
+- φ-spiral lattice initialization
 - Covariant local frame projections
 - TTT-7 resonance field relaxation
 - Steric clash repulsion with covalent bond exclusion
@@ -77,9 +77,7 @@ class NRCEngine:
     # Reference Guide Coordinate Parser
     # ------------------------------------------------------------------
 
-    def _parse_reference_ca(
-        self, pdb_path: str
-    ) -> Optional[np.ndarray]:
+    def _parse_reference_ca(self, pdb_path: str) -> Optional[np.ndarray]:
         """
         Read C-alpha coordinates from a PDB file.
 
@@ -110,9 +108,7 @@ class NRCEngine:
     # TTT-7 Resonance Field
     # ------------------------------------------------------------------
 
-    def _apply_ttt_resonance_field(
-        self, lattice: np.ndarray, step: int
-    ) -> np.ndarray:
+    def _apply_ttt_resonance_field(self, lattice: np.ndarray, step: int) -> np.ndarray:
         """
         Apply the Trageser Tensor Theorem (TTT-7) oscillatory potential.
 
@@ -132,12 +128,16 @@ class NRCEngine:
 
         force_mag = 2 * np.pi * k * np.sin(2 * np.pi * dist * k)
 
-        dr_mask = np.array([(j - 1) % 9 + 1 not in [3, 6, 9] for j in range(n)], dtype=bool)
+        dr_mask = np.array(
+            [(j - 1) % 9 + 1 not in [3, 6, 9] for j in range(n)], dtype=bool
+        )
         combined_mask = mask & dr_mask[np.newaxis, :]
         unit_vectors = diff / (dist[:, :, np.newaxis] + 1e-6)
         forces = np.sum(
-            unit_vectors * force_mag[:, :, np.newaxis] * combined_mask[:, :, np.newaxis],
-            axis=1
+            unit_vectors
+            * force_mag[:, :, np.newaxis]
+            * combined_mask[:, :, np.newaxis],
+            axis=1,
         )
 
         lr = 0.05 / (1 + step * 0.05)
@@ -191,7 +191,6 @@ class NRCEngine:
             contacts=contacts,
             use_annealing=use_annealing,
         )
-
 
     # ------------------------------------------------------------------
     # Multi-Chain Complex Folding
@@ -291,22 +290,21 @@ class NRCEngine:
                 subunit_offset = np.array(
                     [c_idx * 150.0, 0.0, 0.0], dtype=self.precision
                 )
-                lattice[start_idx : start_idx + n] = (
-                    chain_lattice + subunit_offset
-                )
+                lattice[start_idx : start_idx + n] = chain_lattice + subunit_offset
                 start_idx += n
         else:
             # Models 1-4: Physical relaxation (unified under NRCForcefield)
             from .forcefield import NRCForcefield
+
             start_idx = 0
             for c_idx, seq in enumerate(sequences):
                 n = len(seq)
-                
+
                 # Fetch guide coordinates for this subunit if guides are present
                 chain_guide_coords = None
                 if has_guides and ref_ca_list[c_idx] is not None:
                     ref_ca = ref_ca_list[c_idx]
-                    
+
                     # Apply ensemble perturbation for Models 3-4 (model idx > 1)
                     if ensemble_model_idx is not None and ensemble_model_idx > 1:
                         perturbed = np.copy(ref_ca)
@@ -320,18 +318,26 @@ class NRCEngine:
                             else:
                                 t_vec = ref_ca[i] - ref_ca[i - 1]
                             t_norm = np.linalg.norm(t_vec)
-                            t_vec = t_vec / t_norm if t_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+                            t_vec = (
+                                t_vec / t_norm
+                                if t_norm > 1e-6
+                                else np.array([0.0, 0.0, 1.0])
+                            )
 
                             n_vec = np.array([t_vec[1], -t_vec[0], 0.0])
                             n_norm = np.linalg.norm(n_vec)
-                            n_vec = n_vec / n_norm if n_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+                            n_vec = (
+                                n_vec / n_norm
+                                if n_norm > 1e-6
+                                else np.array([1.0, 0.0, 0.0])
+                            )
 
                             shift = amplitude * np.sin(2.0 * np.pi * i / period + phase)
                             perturbed[i] = ref_ca[i] + shift * n_vec
                         chain_guide_coords = perturbed
                     else:
                         chain_guide_coords = ref_ca
-                
+
                 # Filter and adjust contacts local to this subunit
                 chain_contacts = None
                 if contacts is not None:
@@ -343,21 +349,25 @@ class NRCEngine:
                         if start_res <= i < end_res and start_res <= j < end_res:
                             new_c = (i - start_res, j - start_res) + c[2:]
                             chain_contacts.append(new_c)
-                
+
                 # Use unified forcefield with guide constraint if active (k_guide > 0.0)
                 ff = NRCForcefield(
-                    seq, 
-                    contacts=chain_contacts, 
-                    guide_coords=chain_guide_coords, 
-                    k_guide=k_guide
+                    seq,
+                    contacts=chain_contacts,
+                    guide_coords=chain_guide_coords,
+                    k_guide=k_guide,
                 )
-                
+
                 # Run L-BFGS-B or Simulated Annealing
-                opt_coords = ff.optimize(max_iter=steps * 10, use_annealing=use_annealing)
-                
+                opt_coords = ff.optimize(
+                    max_iter=steps * 10, use_annealing=use_annealing
+                )
+
                 # Apply a translation offset of 150A per subunit along the X-axis
                 # to separate subunits in space and avoid inter-subunit steric clashes
-                subunit_offset = np.array([c_idx * 150.0, 0.0, 0.0], dtype=self.precision)
+                subunit_offset = np.array(
+                    [c_idx * 150.0, 0.0, 0.0], dtype=self.precision
+                )
                 lattice[start_idx : start_idx + n] = opt_coords + subunit_offset
                 start_idx += n
 
@@ -374,11 +384,11 @@ class NRCEngine:
         for c_idx, seq in enumerate(sequences):
             n = len(seq)
             chain_id = chain_ids[c_idx]
-            
+
             # Precompute Frenet frames for this chain
             chain_coords = lattice[start_idx : start_idx + n]
             rot = reconstruct_frenet_frames_np(chain_coords, start_idx=0)
-            
+
             for i in range(n):
                 idx = start_idx + i
                 res_dict = atom_lib.get_full_residue(
@@ -394,7 +404,7 @@ class NRCEngine:
 
         # Yield final structure
         coords_array = np.array(frame_coords, dtype=np.float32)
-        
+
         # Apply TTT-7 modular root stabilization post-processing to avoid Chaotic Void {3, 6, 9}
         total_sum = np.sum(np.abs(coords_array)) * 1000.0
         root = (int(round(total_sum)) - 1) % 9 + 1
@@ -406,9 +416,7 @@ class NRCEngine:
                 shift = 0.002
             coords_array[0, 0] += shift
 
-        confidence_array = np.full(
-            len(frame_coords), 100.0, dtype=np.float32
-        )
+        confidence_array = np.full(len(frame_coords), 100.0, dtype=np.float32)
 
         for step in range(1, steps + 1):
             yield {

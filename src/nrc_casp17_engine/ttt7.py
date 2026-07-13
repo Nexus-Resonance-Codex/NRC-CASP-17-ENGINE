@@ -9,7 +9,8 @@ Chaotic Void {3, 6, 9}.
 """
 
 import numpy as np
-from typing import Dict, List, Union
+from typing import Dict, Union
+
 
 class TTT7Auditor:
     """
@@ -46,7 +47,7 @@ class TTT7Auditor:
             digit_sum = sum(int(c) for c in s if c.isdigit())
         else:
             digit_sum = abs(int(val))
-            
+
         if digit_sum == 0:
             return 9
         return (digit_sum - 1) % 9 + 1
@@ -69,7 +70,7 @@ class TTT7Auditor:
             "chaotic_count": chaotic_count,
             "stable_percentage": stable_pct,
             "is_stable": chaotic_count == 0,
-            "status": "STABLE" if chaotic_count == 0 else "CHAOTIC"
+            "status": "STABLE" if chaotic_count == 0 else "CHAOTIC",
         }
 
     @classmethod
@@ -80,14 +81,14 @@ class TTT7Auditor:
         """
         flat_coords = coords.flatten()
         roots = cls.digital_root(flat_coords)
-        
+
         stable_mask = np.isin(roots, list(cls.STABLE_SET))
         stable_count = np.sum(stable_mask)
         total_count = len(roots)
         stable_pct = (stable_count / total_count * 100.0) if total_count > 0 else 0.0
 
-        chaotic_indices = np.where(~stable_mask)[0]
-        
+        np.where(~stable_mask)[0]
+
         return {
             "total_atoms": len(coords),
             "total_coordinates": total_count,
@@ -96,5 +97,5 @@ class TTT7Auditor:
             "stable_percentage": float(stable_pct),
             "is_stable": stable_count == total_count,
             "status": "STABLE" if stable_count == total_count else "CHAOTIC",
-            "chaotic_coordinate_fraction": float(1.0 - stable_pct / 100.0)
+            "chaotic_coordinate_fraction": float(1.0 - stable_pct / 100.0),
         }

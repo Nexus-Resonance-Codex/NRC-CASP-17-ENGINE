@@ -22,7 +22,14 @@ class NRCForcefield:
     All-Atom and CA-Lattice Ab Initio Thermodynamic Forcefield.
     """
 
-    def __init__(self, sequence: str, weights: dict = None, contacts: list = None, guide_coords: np.ndarray = None, k_guide: float = 0.0):
+    def __init__(
+        self,
+        sequence: str,
+        weights: dict = None,
+        contacts: list = None,
+        guide_coords: np.ndarray = None,
+        k_guide: float = 0.0,
+    ):
         self.sequence = sequence
         self.N_res = len(sequence)
         self.contacts = contacts
@@ -45,7 +52,7 @@ class NRCForcefield:
             "torsion": 25.0,
             "elec": 5.0,
             "rg": 100.0,
-            "contact": 50.0
+            "contact": 50.0,
         }
 
         # Try loading calibrated weights
@@ -72,7 +79,7 @@ class NRCForcefield:
             contacts=self.contacts,
             charges=self.charges,
             guide_coords=self.guide_coords,
-            k_guide=self.k_guide
+            k_guide=self.k_guide,
         )
 
         # Set up coordinates using the new geometry initializer or guide coordinates
@@ -96,9 +103,7 @@ class NRCForcefield:
 
     def fragment_based_initialization(self, N: int) -> np.ndarray:
         return fragment_based_initialization(
-            self.sequence, 
-            self.potential.p_alpha, 
-            self.potential.p_beta
+            self.sequence, self.potential.p_alpha, self.potential.p_beta
         )
 
     def energy_and_gradient(self, coords_flat: np.ndarray) -> tuple:
@@ -107,11 +112,11 @@ class NRCForcefield:
         """
         coords_t = torch.tensor(coords_flat, dtype=torch.float64, requires_grad=True)
         energy_t = self.potential.compute_energy(coords_t)
-        
+
         # Compute backward gradients
         energy_t.backward()
         grad = coords_t.grad.detach().numpy()
-        
+
         return energy_t.item(), grad
 
     def optimize(self, max_iter: int = 500, use_annealing: bool = False) -> np.ndarray:
@@ -135,7 +140,10 @@ class NRCForcefield:
         rot = reconstruct_backbone_frames_np(ca_coords)
 
         for i, aa in enumerate(self.sequence):
-            phi, psi = 0.0, 0.0  # Kept for compatibility with get_full_residue signature
+            phi, psi = (
+                0.0,
+                0.0,
+            )  # Kept for compatibility with get_full_residue signature
             res_dict = self.atom_lib.get_full_residue(
                 aa, ca_coords[i], rotation_matrix=rot[i], phi=phi, psi=psi
             )

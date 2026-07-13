@@ -16,7 +16,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Engine folding test failed: {e}")
         sys.exit(1)
-        
+
     print("\nRunning ab initio folding test...")
     try:
         test_ab_initio_folding()
@@ -34,4 +34,3 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("\nAll tests completed successfully.")
-

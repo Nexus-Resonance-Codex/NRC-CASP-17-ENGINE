@@ -166,9 +166,7 @@ class NRCAtoms:
         r31 = -np.sin(psi)
         r32 = 0
         r33 = np.cos(psi)
-        return np.array(
-            [[r11, r12, r13], [r21, r22, r23], [r31, r32, r33]]
-        )
+        return np.array([[r11, r12, r13], [r21, r22, r23], [r31, r32, r33]])
 
     @classmethod
     def get_full_residue(

@@ -4,26 +4,30 @@ geometry.py — Coordinate projection and secondary structure initialization
 
 import numpy as np
 import torch
-from .atoms import NRCAtoms
 
 PHI = (1 + np.sqrt(5)) / 2
 GOLDEN_ANGLE = 2 * np.pi / (PHI**2)
 
-def fragment_based_initialization(sequence: str, p_alpha: np.ndarray, p_beta: np.ndarray) -> np.ndarray:
+
+def fragment_based_initialization(
+    sequence: str, p_alpha: np.ndarray, p_beta: np.ndarray
+) -> np.ndarray:
     """
     Assemble sequence fragments using Chou-Fasman propensities to generate
     idealized CA local geometries (alpha helix vs beta strand).
     """
     N = len(sequence)
     coords = np.zeros((N, 3), dtype=np.float64)
-    
+
     # Ideal parameters
     bond_len = 3.8
-    
+
     # Helix CA parameters
     alpha_angle = 90.0 * np.pi / 180.0
-    alpha_dihedral = 51.82729 * np.pi / 180.0  # Mathematically exact QRT resonance angle
-    
+    alpha_dihedral = (
+        51.82729 * np.pi / 180.0
+    )  # Mathematically exact QRT resonance angle
+
     # Beta CA parameters
     beta_angle = 120.0 * np.pi / 180.0
     beta_dihedral = 170.0 * np.pi / 180.0
@@ -32,42 +36,46 @@ def fragment_based_initialization(sequence: str, p_alpha: np.ndarray, p_beta: np
     if N > 1:
         coords[1] = [bond_len, 0.0, 0.0]
     if N > 2:
-        coords[2] = [bond_len + bond_len * np.cos(np.pi - alpha_angle), 
-                     bond_len * np.sin(np.pi - alpha_angle), 
-                     0.0]
-                     
+        coords[2] = [
+            bond_len + bond_len * np.cos(np.pi - alpha_angle),
+            bond_len * np.sin(np.pi - alpha_angle),
+            0.0,
+        ]
+
     for i in range(3, N):
         p_a = p_alpha[i]
         p_b = p_beta[i]
-        
+
         if p_a > p_b and p_a > 1.0:
             ang = alpha_angle
             dih = alpha_dihedral
         else:
             ang = beta_angle
             dih = beta_dihedral
-            
-        v1 = coords[i-1] - coords[i-2]
-        v2 = coords[i-2] - coords[i-3]
-        
+
+        v1 = coords[i - 1] - coords[i - 2]
+        v2 = coords[i - 2] - coords[i - 3]
+
         v1_norm = v1 / (np.linalg.norm(v1) + 1e-9)
         v2_norm = v2 / (np.linalg.norm(v2) + 1e-9)
-        
+
         n = np.cross(v2_norm, v1_norm)
         n_norm = np.linalg.norm(n)
-        
+
         if n_norm < 1e-3:
             n = np.array([0.0, 0.0, 1.0])
         else:
             n = n / n_norm
-            
+
         b = np.cross(v1_norm, n)
-        
-        vec = bond_len * (np.cos(np.pi - ang) * v1_norm + 
-                          np.sin(np.pi - ang) * np.cos(dih) * b + 
-                          np.sin(np.pi - ang) * np.sin(dih) * n)
-                          
-        coords[i] = coords[i-1] + vec
+
+        vec = bond_len * (
+            np.cos(np.pi - ang) * v1_norm
+            + np.sin(np.pi - ang) * np.cos(dih) * b
+            + np.sin(np.pi - ang) * np.sin(dih) * n
+        )
+
+        coords[i] = coords[i - 1] + vec
 
     # Center on origin
     coords -= np.mean(coords, axis=0)
@@ -85,7 +93,11 @@ def reconstruct_backbone_frames_t(coords: torch.Tensor) -> torch.Tensor:
         u_i = torch.cat([u_i_raw[0:1], u_i_raw], dim=0)
         u_i = u_i / (torch.norm(u_i, dim=1, keepdim=True) + 1e-9)
 
-        u_prev_init = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float64, device=coords.device)
+        u_prev_init = torch.tensor(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=torch.float64,
+            device=coords.device,
+        )
         if N > 2:
             u_prev = torch.cat([u_prev_init, u_i[1:-1]], dim=0)
         else:
@@ -97,10 +109,10 @@ def reconstruct_backbone_frames_t(coords: torch.Tensor) -> torch.Tensor:
         fallback_x = torch.where(
             torch.abs(u_i[:, 2:3]) < 0.9,
             torch.stack([u_i[:, 1], -u_i[:, 0], torch.zeros_like(u_i[:, 0])], dim=1),
-            torch.stack([torch.zeros_like(u_i[:, 0]), u_i[:, 2], -u_i[:, 1]], dim=1)
+            torch.stack([torch.zeros_like(u_i[:, 0]), u_i[:, 2], -u_i[:, 1]], dim=1),
         )
         fallback_x = fallback_x / (torch.norm(fallback_x, dim=1, keepdim=True) + 1e-9)
-        
+
         x_norm_safe = torch.where(x_norm < 1e-3, torch.ones_like(x_norm), x_norm)
         x_vec_normalized = x_vec / x_norm_safe
         x_vec = torch.where(x_norm < 1e-3, fallback_x, x_vec_normalized)
@@ -120,6 +132,7 @@ def reconstruct_backbone_frames_np(coords: np.ndarray) -> np.ndarray:
     """
     return reconstruct_frenet_frames_np(coords, start_idx=0)
 
+
 def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.ndarray:
     """
     Reconstruct covariant local Frenet-Serret coordinate frames for each CA atom.
@@ -127,7 +140,7 @@ def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.n
     N = coords.shape[0]
     rot = np.zeros((N, 3, 3), dtype=np.float64)
     for i in range(N):
-        idx = start_idx + i
+        start_idx + i
         if i == 0:
             if N > 1:
                 u_i = coords[1] - coords[0]
@@ -161,12 +174,12 @@ def reconstruct_frenet_frames_np(coords: np.ndarray, start_idx: int = 0) -> np.n
                 if abs(u_i[2]) < 0.9
                 else np.array([0.0, u_i[2], -u_i[1]])
             )
-            x_i /= (np.linalg.norm(x_i) + 1e-9)
+            x_i /= np.linalg.norm(x_i) + 1e-9
         else:
             x_i /= x_norm
 
         y_i = np.cross(u_i, x_i)
-        y_i /= (np.linalg.norm(y_i) + 1e-9)
+        y_i /= np.linalg.norm(y_i) + 1e-9
 
         rot[i] = np.column_stack((x_i, y_i, u_i))
     return rot
