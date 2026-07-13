@@ -485,7 +485,7 @@ def main():
                 f"TARGET {target_id}",
                 "AUTHOR 1538-3563-3786",
                 "REMARK AUTHOR 1538-3563-3786",
-                "METHOD Nexus Resonance Codex (NRC) (NRC) deterministic phi-spiral RNA folding engine.",
+                "METHOD Nexus Resonance Codex (NRC) (NRC) (NRC) deterministic phi-spiral RNA folding engine.",
                 "METHOD Employs Trageser Tensor Theorem (TTT-7) for 2048D lattice resonance.",
                 "METHOD Structural templates aligned to RCSB homology models via Kabsch mapping.",
                 f"MODEL  {model_num}",
