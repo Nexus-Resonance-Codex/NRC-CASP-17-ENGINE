@@ -1,6 +1,4 @@
 ---
-
----
 title: Resonance Fold
 emoji: 🧬
 colorFrom: indigo
