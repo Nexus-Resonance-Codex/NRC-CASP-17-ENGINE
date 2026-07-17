@@ -15,12 +15,12 @@ Core Modules:
     - formatter: CASP-compliant PDB/submission text formatter
     - ttt7: TTT-7 digital root stability auditor
 
-Copyright © 2026 Nexus Resonance Codex Team. All Rights Reserved.
+Copyright © 2026 Nexus Resonance Codex (NRC) Team. All Rights Reserved.
 Licensed under CC BY-NC-SA 4.0 (see LICENSE.md).
 """
 
 __version__ = "1.0.0"
-__author__ = "Nexus Resonance Codex Team"
+__author__ = "Nexus Resonance Codex (NRC) Team"
 __license__ = "CC BY-NC-SA 4.0"
 
 from .engine import NRCEngine

@@ -261,7 +261,7 @@ class NRCEngine:
         else:
             ref_ca_list = [None] * n_chains
 
-        has_guides = all(r is not None for r in ref_ca_list)
+        has_guides = len(ref_ca_list) > 0 and all(r is not None for r in ref_ca_list)
 
         # Determine model mode
         is_pure_template = ensemble_model_idx == 4 and has_guides
