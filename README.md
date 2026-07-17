@@ -1,8 +1,5 @@
 ---
-title: Resonance Fold
-emoji: 🧬
-colorFrom: indigo
-colorTo: purple
+title: NRC-CASP-17-ENGINE
 sdk: docker
 app_file: app.py
 app_port: 7860
@@ -61,9 +58,9 @@ Lattice-parity embeddings are validated by ensuring that the digital root of the
 The engine is modularized to decouple forward kinematics, energy calculations, optimization, and biophysical reporting. Below is a detailed breakdown of each script and its component functions:
 
 ### 1. `geometry.py` — Backbone Kinematics & Coordinate Projection
-This module acts as the forward kinematics engine, converting internal coordinates (bond lengths, bond angles, and dihedrals) into 3D cartesian coordinates.
+This module acts as the forward kinematics engine, converting internal coordinates (bond lengths, bond angles, and dihedrals) into 3D Cartesian coordinates.
 * **`FrenetFrameReconstructor`**: Implements the Frenet-Serret equations to build the protein backbone from local curvature and torsion. It translates angular movements into a continuous chain of 3D coordinates.
-* **`alpha_dihedral`**: Enforces the exact mathematical resonance attractor:
+* **`alpha_dihedral`**: Enforces the exact mathematical resonance, attractor:
   ```python
   alpha_dihedral = 51.82729 * np.pi / 180.0
   ```
@@ -149,9 +146,3 @@ To launch the local Gradio interface:
 python app.py
 ```
 
----
-
-## ⚖️ License
-This project is licensed under a **Dual-License**:
-- **CC BY-NC-SA 4.0** for academic, non-commercial, and humanitarian research.
-- **Commercial License** for enterprise deployment, drug discovery, or proprietary development.
