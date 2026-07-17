@@ -1,14 +1,3 @@
-# ⚖️ Licensing & Enterprise Architecture (Nexus Resonance Codex (NRC))
-
-This repository operates on a **Dual-License** structure to protect the integrity of the Nexus Resonance Codex (NRC) while supporting open scientific validation.
-
-* **Codebase:** [AGPL-3.0](LICENSE) (Ensures any cloud/network deployment remains entirely open-source).
-* **Data & Weights:** [CC BY-NC-SA 4.0](LICENSE-DATA) (Strictly prohibits free commercial use).
-* **Trademarks & Math Integrity:** [Trademark Policy](TRADEMARK_POLICY.md) (Protects the TTT-7, QRT, and mathematical nomenclatures).
-* **Patent Protection:** [Patent Pledge](PATENT_PLEDGE.md) (Tesla-style Good Faith Patent Covenant).
-
-🏢 **Corporate & Drug Discovery Entities:** If you require the use of Nexus Resonance Codex (NRC) frameworks in a closed-source, proprietary, or for-profit environment, you must purchase an Enterprise License. See [COMMERCIAL_USE.md](COMMERCIAL_USE.md) for details or contact **James Paul Trageser** at **NexusResonanceCodex@gmail.com**.
-
 ---
 
 ---
@@ -22,11 +11,16 @@ app_port: 7860
 pinned: false
 ---
 
-# 🧬 NRC-CASP-17-ENGINE: Pure Math Protein Folding Engine
+# ⚖️ Licensing & Enterprise Architecture (Nexus Resonance Codex (NRC))
 
-Welcome to the official repository of the **NRC-CASP-17-ENGINE** (Resonance-Fold). This repository houses the high-fidelity, deterministic protein structure prediction engine built on the **Nexus Resonance Codex (NRC)** framework.
+This repository operates on a **Dual-License** structure to protect the integrity of the Nexus Resonance Codex (NRC) while supporting open scientific validation.
 
-This engine is designed to predict and refine protein structures using deterministic polymer physics, analytical geometry, and digital root resonance constraints. **It operates with zero runtime AI inference or external API dependencies**, allowing it to run fully locally, deterministically, and with extreme computational efficiency.
+* **Codebase:** [AGPL-3.0](LICENSE) (Ensures any cloud/network deployment remains entirely open-source).
+* **Data & Weights:** [CC BY-NC-SA 4.0](LICENSE-DATA) (Strictly prohibits free commercial use).
+* **Trademarks & Math Integrity:** [Trademark Policy](TRADEMARK_POLICY.md) (Protects the TTT-7, QRT, and mathematical nomenclatures).
+* **Patent Protection:** [Patent Pledge](PATENT_PLEDGE.md) (Tesla-style Good Faith Patent Covenant).
+
+🏢 **Corporate & Drug Discovery Entities:** If you require the use of Nexus Resonance Codex (NRC) frameworks in a closed-source, proprietary, or for-profit environment, you must purchase an Enterprise License. See [COMMERCIAL_USE.md](COMMERCIAL_USE.md) for details or contact **James Paul Trageser** at **NexusResonanceCodex@gmail.com**.
 
 ---
 
