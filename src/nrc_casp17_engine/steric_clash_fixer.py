@@ -77,34 +77,37 @@ def refine_pdb_in_place(filepath, min_dist=1.2, iterations=50, step_size=0.1):
     bonds = []
     bonded_neighbors = {i: set() for i in range(n_atoms)}
     
-    # Find covalent bonds based on chemical rules
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            d = np.linalg.norm(coords_np[i] - coords_np[j])
+    # Find covalent bonds based on chemical rules using KDTree spatial query for O(N log N) speed
+    from scipy.spatial import KDTree
+    tree = KDTree(coords_np)
+    candidate_pairs = tree.query_pairs(r=2.5)
+    
+    for i, j in candidate_pairs:
+        d = np.linalg.norm(coords_np[i] - coords_np[j])
+        
+        is_bond = False
+        # Rule 1: Same residue, distance in [0.8, 1.65] A
+        if (res_indices[i] == res_indices[j] and 
+            chain_ids[i] == chain_ids[j] and 
+            0.8 < d < 1.65):
+            is_bond = True
+        # Rule 2: Peptide bond between consecutive residues
+        elif (chain_ids[i] == chain_ids[j] and 
+              abs(res_indices[i] - res_indices[j]) == 1 and 
+              ((atom_names[i] == "C" and atom_names[j] == "N") or 
+               (atom_names[i] == "N" and atom_names[j] == "C")) and 
+              1.0 < d < 1.65):
+            is_bond = True
+        # Rule 3: Disulfide bond
+        elif (atom_names[i] == "SG" and atom_names[j] == "SG" and d < 2.2):
+            is_bond = True
             
-            is_bond = False
-            # Rule 1: Same residue, distance in [0.8, 1.65] A
-            if (res_indices[i] == res_indices[j] and 
-                chain_ids[i] == chain_ids[j] and 
-                0.8 < d < 1.65):
-                is_bond = True
-            # Rule 2: Peptide bond between consecutive residues
-            elif (chain_ids[i] == chain_ids[j] and 
-                  abs(res_indices[i] - res_indices[j]) == 1 and 
-                  ((atom_names[i] == "C" and atom_names[j] == "N") or 
-                   (atom_names[i] == "N" and atom_names[j] == "C")) and 
-                  1.0 < d < 1.65):
-                is_bond = True
-            # Rule 3: Disulfide bond
-            elif (atom_names[i] == "SG" and atom_names[j] == "SG" and d < 2.2):
-                is_bond = True
-                
-            if is_bond:
-                # Enforce physical bond length (1.45 A) if the starting bond was severely compressed
-                target_d = d if d >= 1.30 else 1.45
-                bonds.append((i, j, target_d))
-                bonded_neighbors[i].add(j)
-                bonded_neighbors[j].add(i)
+        if is_bond:
+            # Enforce physical bond length (1.45 A) if the starting bond was severely compressed
+            target_d = d if d >= 1.30 else 1.45
+            bonds.append((i, j, target_d))
+            bonded_neighbors[i].add(j)
+            bonded_neighbors[j].add(i)
 
     # Exclude 1-2 (bonded) and 1-3 (angle) pairs from steric repulsion
     excluded_pairs = set()
