@@ -45,7 +45,13 @@ EMAIL = "jtrageser@gmail.com"
 STD_URL = "https://predictioncenter.org/casp17/submit"
 ENSMBL_URL = "https://predictioncenter.org/casp17/predictions_submission_ENSMBL.cgi"
 
-NVAPI_KEY = "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"
+NVAPI_KEY = os.environ.get("NVIDIA_API_KEY", "")
+if not NVAPI_KEY:
+    try:
+        with open("/mnt/2TBext/FOLD-TEMP/CASP-17/nvidia_keys.json", "r") as f:
+            NVAPI_KEY = json.load(f).get("NVIDIA_API_KEY_1", "")
+    except Exception:
+        pass
 
 os.makedirs(FASTA_DIR, exist_ok=True)
 os.makedirs(SUBMIT_DIR_AG, exist_ok=True)
